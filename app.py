@@ -1,436 +1,671 @@
 
 import streamlit as st
 import pandas as pd
-from datetime import datetime, timedelta
+import requests
+import plotly.express as px
+import time
+from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
-from dhanhq import DhanContext, dhanhq
+from io import BytesIO
 
+# =====================================================
+# CONFIGURATION
+# =====================================================
 st.set_page_config(
-    page_title="NSE F&O Paper Scanner",
+    page_title="NSE F&O Top 10 Scanner",
     page_icon="📊",
-    layout="wide"
+    layout="wide",
 )
 
 IST = ZoneInfo("Asia/Kolkata")
+API = "https://api.dhan.co/v2"
+MASTER_URL = (
+    "https://images.dhan.co/api-data/"
+    "api-scrip-master-detailed.csv"
+)
+REFRESH_SECONDS = 10
+MARKET_START = dt_time(9, 15)
+MARKET_END = dt_time(15, 30)
 
-WATCHLIST = [
-    "RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN", "INFY",
-    "TCS", "AXISBANK", "TATAMOTORS", "LT", "BHARTIARTL"
-]
+SECTOR_MAP = {
+    "RELIANCE": "Energy",
+    "ONGC": "Energy",
+    "IOC": "Energy",
+    "BPCL": "Energy",
+    "HINDPETRO": "Energy",
+    "GAIL": "Energy",
+    "NTPC": "Power",
+    "POWERGRID": "Power",
+    "TATAPOWER": "Power",
+    "ADANIGREEN": "Power",
+    "TCS": "IT",
+    "INFY": "IT",
+    "WIPRO": "IT",
+    "HCLTECH": "IT",
+    "TECHM": "IT",
+    "LTIM": "IT",
+    "PERSISTENT": "IT",
+    "COFORGE": "IT",
+    "HDFCBANK": "Banking",
+    "ICICIBANK": "Banking",
+    "SBIN": "Banking",
+    "AXISBANK": "Banking",
+    "KOTAKBANK": "Banking",
+    "INDUSINDBK": "Banking",
+    "BANKBARODA": "Banking",
+    "PNB": "Banking",
+    "CANBK": "Banking",
+    "FEDERALBNK": "Banking",
+    "IDFCFIRSTB": "Banking",
+    "BAJFINANCE": "Financial Services",
+    "BAJAJFINSV": "Financial Services",
+    "SHRIRAMFIN": "Financial Services",
+    "CHOLAFIN": "Financial Services",
+    "SBILIFE": "Financial Services",
+    "HDFCLIFE": "Financial Services",
+    "ICICIGI": "Financial Services",
+    "LICI": "Financial Services",
+    "MARUTI": "Auto",
+    "TATAMOTORS": "Auto",
+    "M&M": "Auto",
+    "HEROMOTOCO": "Auto",
+    "EICHERMOT": "Auto",
+    "BAJAJ-AUTO": "Auto",
+    "TVSMOTOR": "Auto",
+    "ASHOKLEY": "Auto",
+    "BHARATFORG": "Auto",
+    "TATASTEEL": "Metals",
+    "JSWSTEEL": "Metals",
+    "HINDALCO": "Metals",
+    "VEDL": "Metals",
+    "JINDALSTEL": "Metals",
+    "NMDC": "Metals",
+    "SAIL": "Metals",
+    "COALINDIA": "Metals",
+    "HINDUNILVR": "FMCG",
+    "ITC": "FMCG",
+    "NESTLEIND": "FMCG",
+    "BRITANNIA": "FMCG",
+    "DABUR": "FMCG",
+    "GODREJCP": "FMCG",
+    "MARICO": "FMCG",
+    "TATACONSUM": "FMCG",
+    "VBL": "FMCG",
+    "SUNPHARMA": "Pharma",
+    "DRREDDY": "Pharma",
+    "CIPLA": "Pharma",
+    "DIVISLAB": "Pharma",
+    "APOLLOHOSP": "Healthcare",
+    "MAXHEALTH": "Healthcare",
+    "FORTIS": "Healthcare",
+    "LT": "Infrastructure",
+    "ADANIENT": "Infrastructure",
+    "ADANIPORTS": "Infrastructure",
+    "ULTRACEMCO": "Cement",
+    "GRASIM": "Cement",
+    "AMBUJACEM": "Cement",
+    "ACC": "Cement",
+    "DLF": "Real Estate",
+    "GODREJPROP": "Real Estate",
+    "OBEROIRLTY": "Real Estate",
+    "PHOENIXLTD": "Real Estate",
+    "INDIGO": "Aviation",
+    "TRENT": "Retail",
+    "NYKAA": "Retail",
+    "DMART": "Retail",
+    "ZOMATO": "Internet",
+    "ETERNAL": "Internet",
+    "PAYTM": "Internet",
+    "BEL": "Defence",
+    "HAL": "Defence",
+    "BDL": "Defence",
+}
 
-st.title("📊 NSE F&O Paper Trading Scanner")
-st.caption("5-minute candles | No demo data | Paper trading only")
+st.markdown("""
+<style>
+.block-container {padding-top: 1rem;}
+div[data-testid="stMetric"] {
+    background: #142033;
+    padding: 12px;
+    border-radius: 10px;
+}
+</style>
+""", unsafe_allow_html=True)
 
-if "paper_trades" not in st.session_state:
-    st.session_state.paper_trades = []
+st.title("📊 NSE F&O Top 10 Activity Scanner")
+st.caption(
+    "Dhan live quotes · Top 10 activity ranking · "
+    "Sector heatmap · Display-only scanner"
+)
 
-if "scan_results" not in st.session_state:
-    st.session_state.scan_results = pd.DataFrame()
-
-
-def get_dhan_client():
-    client_id = st.secrets.get("DHAN_CLIENT_ID", "")
-    access_token = st.secrets.get("DHAN_ACCESS_TOKEN", "")
-
-    if not client_id or not access_token:
-        raise ValueError(
-            "Streamlit Secrets mein DHAN_CLIENT_ID aur "
-            "DHAN_ACCESS_TOKEN set karein."
-        )
-
-    context = DhanContext(client_id, access_token)
-    return dhanhq(context)
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_security_master():
-    # Dhan SDK ka security master
-    client = get_dhan_client()
-    df = client.fetch_security_list("compact")
-
-    if isinstance(df, dict):
-        df = df.get("data", df)
-
-    if not isinstance(df, pd.DataFrame):
-        df = pd.DataFrame(df)
-
-    df.columns = [str(c).strip().upper() for c in df.columns]
-    return df
+# =====================================================
+# DHAN AUTHENTICATION
+# =====================================================
+def get_credentials():
+    try:
+        client_id = str(st.secrets["DHAN_CLIENT_ID"]).strip()
+        token = str(st.secrets["DHAN_ACCESS_TOKEN"]).strip()
+        if client_id and token:
+            return client_id, token
+    except Exception:
+        pass
+    return "", ""
 
 
-def get_security_ids():
-    df = load_security_master()
+CLIENT_ID, ACCESS_TOKEN = get_credentials()
 
-    required = [
-        "SEM_EXM_EXCH_ID",
-        "SEM_SEGMENT",
-        "SEM_SMST_SECURITY_ID"
-    ]
 
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(
-            "Security master columns missing: "
-            + ", ".join(missing)
-            + ". Available: "
-            + ", ".join(df.columns.astype(str))
-        )
+def headers():
+    return {
+        "access-token": ACCESS_TOKEN,
+        "client-id": CLIENT_ID,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
 
-    symbol_col = next(
-        (
-            c for c in [
-                "SEM_TRADING_SYMBOL",
-                "SEM_CUSTOM_SYMBOL",
-                "SM_SYMBOL_NAME"
-            ]
-            if c in df.columns
-        ),
-        None
+
+def market_is_open():
+    now = datetime.now(IST)
+    return (
+        now.weekday() < 5
+        and MARKET_START <= now.time() <= MARKET_END
     )
 
-    if not symbol_col:
-        raise ValueError("Trading symbol column nahi mila.")
 
-    for col in ["SEM_EXM_EXCH_ID", "SEM_SEGMENT", symbol_col]:
-        df[col] = df[col].astype(str).str.strip().str.upper()
+# =====================================================
+# LOAD DHAN INSTRUMENT MASTER
+# =====================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_fno_universe():
+    response = requests.get(MASTER_URL, timeout=30)
+    response.raise_for_status()
 
-    df = df[
-        (df["SEM_EXM_EXCH_ID"] == "NSE")
-        & (df["SEM_SEGMENT"] == "E")
+    df = pd.read_csv(
+        BytesIO(response.content),
+        low_memory=False,
+    )
+    df.columns = [str(c).strip().upper() for c in df.columns]
+
+    def col(*names):
+        for name in names:
+            if name in df.columns:
+                return name
+        return None
+
+    exchange_col = col("EXCH_ID", "SEM_EXM_EXCH_ID")
+    segment_col = col("SEGMENT", "SEM_SEGMENT")
+    instrument_col = col("INSTRUMENT", "SEM_INSTRUMENT_NAME")
+    security_col = col("SECURITY_ID", "SEM_SMST_SECURITY_ID")
+    underlying_col = col("UNDERLYING_SYMBOL")
+    symbol_col = col(
+        "SYMBOL_NAME",
+        "TRADING_SYMBOL",
+        "SYMBOL",
+        "SEM_TRADING_SYMBOL",
+    )
+
+    if not all([
+        exchange_col,
+        segment_col,
+        instrument_col,
+        security_col,
+    ]):
+        raise ValueError(
+            "Dhan instrument master ke required columns nahi mile."
+        )
+
+    for c in [exchange_col, segment_col, instrument_col]:
+        df[c] = df[c].astype(str).str.strip().str.upper()
+
+    # NSE stock futures identify the F&O-eligible stock universe.
+    futures = df[
+        (df[exchange_col] == "NSE")
+        & (df[segment_col] == "D")
+        & (df[instrument_col] == "FUTSTK")
     ].copy()
 
-    if "SEM_INSTRUMENT_NAME" in df.columns:
-        instrument = (
-            df["SEM_INSTRUMENT_NAME"]
-            .astype(str).str.strip().str.upper()
+    if underlying_col and not futures.empty:
+        fno_symbols = set(
+            futures[underlying_col]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .str.upper()
         )
-        df = df[instrument.isin(["EQUITY", "EQ"])]
-
-    df["SEM_SMST_SECURITY_ID"] = (
-        df["SEM_SMST_SECURITY_ID"].astype(str).str.strip()
-    )
-
-    return dict(
-        zip(df[symbol_col], df["SEM_SMST_SECURITY_ID"])
-    )
-
-
-def fetch_candles(client, security_id):
-    now = datetime.now(IST)
-
-    # Recent date range allows the API to return recent candles.
-    end_date = now.date()
-    start_date = end_date - timedelta(days=7)
-
-    response = client.intraday_minute_data(
-        security_id=str(security_id),
-        exchange_segment="NSE_EQ",
-        instrument_type="EQUITY",
-        from_date=start_date.isoformat(),
-        to_date=end_date.isoformat(),
-        interval=5,
-    )
-
-    if not isinstance(response, dict):
+    elif symbol_col and not futures.empty:
+        fno_symbols = set(
+            futures[symbol_col]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .str.upper()
+        )
+    else:
         raise ValueError(
-            "Unexpected API response: " + str(response)[:500]
+            "Stock futures ke underlying symbols nahi mile."
         )
 
-    if response.get("status") == "failure":
+    # Map each underlying to its NSE equity security ID.
+    equities = df[
+        (df[exchange_col] == "NSE")
+        & (df[segment_col] == "E")
+    ].copy()
+
+    if not symbol_col:
+        raise ValueError("Equity symbol column nahi mila.")
+
+    equities["_SYMBOL"] = (
+        equities[symbol_col]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+    equities = equities[equities["_SYMBOL"].isin(fno_symbols)]
+
+    # Remove non-numeric/invalid IDs.
+    equities["_SID"] = pd.to_numeric(
+        equities[security_col], errors="coerce"
+    )
+    equities = equities.dropna(subset=["_SID"])
+    equities["_SID"] = equities["_SID"].astype("int64")
+
+    equities = equities.drop_duplicates("_SYMBOL")
+
+    if equities.empty:
         raise ValueError(
-            "Dhan API failure: "
-            + str(response.get("remarks", response))[:500]
+            "F&O symbols ke NSE equity IDs nahi mile. "
+            "Dhan master CSV columns check karein."
         )
 
-    data = response.get("data", response)
+    result = pd.DataFrame({
+        "symbol": equities["_SYMBOL"],
+        "security_id": equities["_SID"].astype(int),
+    })
 
-    if not isinstance(data, dict):
-        raise ValueError("Dhan candle response format galat hai.")
+    result["sector"] = result["symbol"].map(SECTOR_MAP).fillna("Other")
 
-    if not data or not isinstance(data.get("close"), (list, tuple)):
-        raise ValueError(
-            "Dhan ne candle data nahi diya. API response: "
-            + str(response)[:700]
+    return result.sort_values("symbol").reset_index(drop=True)
+
+
+# =====================================================
+# FETCH LIVE QUOTE + VOLUME FOR ALL F&O STOCKS
+# One quote snapshot per refresh; Top 10 is selected locally.
+# =====================================================
+def get_quotes(universe):
+    result = {}
+    ids = universe["security_id"].astype(int).tolist()
+
+    # Dhan market quote supports up to 1000 IDs per request.
+    for start in range(0, len(ids), 1000):
+        batch = ids[start:start + 1000]
+
+        response = requests.post(
+            f"{API}/marketfeed/quote",
+            headers=headers(),
+            json={"NSE_EQ": batch},
+            timeout=20,
         )
+        response.raise_for_status()
+        body = response.json()
 
-    df = pd.DataFrame(data)
-    df.columns = [str(c).strip().lower() for c in df.columns]
+        if str(body.get("status", "")).lower() != "success":
+            raise RuntimeError(
+                str(body.get("remarks") or body.get("message") or body)
+            )
 
-    required = ["open", "high", "low", "close"]
-    missing = [c for c in required if c not in df.columns]
+        data = body.get("data", {}).get("NSE_EQ", {})
 
-    if missing:
-        raise ValueError(
-            "Candle columns missing: " + ", ".join(missing)
-        )
+        for sid, item in data.items():
+            try:
+                sid = int(sid)
+                ltp = float(item.get("last_price") or 0)
+                volume = int(item.get("volume") or 0)
+                ohlc = item.get("ohlc") or {}
+                prev_close = float(ohlc.get("close") or 0)
 
-    for col in required:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+                if ltp <= 0:
+                    continue
 
-    if "volume" not in df.columns:
-        df["volume"] = 0
+                result[sid] = {
+                    "security_id": sid,
+                    "ltp": ltp,
+                    "volume": volume,
+                    "last_quantity": int(item.get("last_quantity") or 0),
+                    "buy_quantity": int(item.get("buy_quantity") or 0),
+                    "sell_quantity": int(item.get("sell_quantity") or 0),
+                    "open": float(ohlc.get("open") or 0),
+                    "high": float(ohlc.get("high") or 0),
+                    "low": float(ohlc.get("low") or 0),
+                    "prev_close": prev_close,
+                    "change_pct": (
+                        (ltp - prev_close) / prev_close * 100
+                        if prev_close > 0 else 0.0
+                    ),
+                }
+            except (TypeError, ValueError):
+                continue
 
-    df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
-    df = df.dropna(subset=required)
-
-    return df.tail(30).reset_index(drop=True)
-
-
-def candle_signal(df):
-    # Signals require actual uploaded/API candles only.
-    if df is None or len(df) < 3:
-        return "NO SIGNAL"
-
-    previous = df.iloc[-2]
-    current = df.iloc[-1]
-
-    if current["close"] > previous["high"]:
-        return "BUY"
-    if current["close"] < previous["low"]:
-        return "SELL"
-
-    return "WAIT"
+    return result
 
 
-# Sidebar
-st.sidebar.header("Scanner Settings")
+# =====================================================
+# SIDEBAR
+# =====================================================
+with st.sidebar:
+    st.header("⚙️ Scanner Settings")
+    scanner_on = st.toggle("Scanner ON/OFF", value=True)
+    auto_refresh = st.toggle("Auto refresh (10 sec)", value=True)
+    st.caption("NSE regular market: 09:15–15:30 IST")
+    st.caption("Only the 10 highest-activity stocks are displayed.")
+    st.caption("No real orders are placed by this app.")
 
-mode = st.sidebar.radio(
-    "Data source",
-    ["Dhan API", "Upload Candle CSV"]
+if not scanner_on:
+    st.warning("Scanner OFF hai. Live quote request nahi ki ja rahi.")
+    st.stop()
+
+if not CLIENT_ID or not ACCESS_TOKEN:
+    st.error(
+        "Streamlit Secrets mein DHAN_CLIENT_ID aur "
+        "DHAN_ACCESS_TOKEN set karein."
+    )
+    st.stop()
+
+try:
+    universe = load_fno_universe()
+except Exception as exc:
+    st.error(f"F&O universe load nahi hua: {exc}")
+    st.stop()
+
+if universe.empty:
+    st.error("NSE F&O universe khaali hai.")
+    st.stop()
+
+# =====================================================
+# LIVE DATA AND ACTIVITY RANKING
+# =====================================================
+now = datetime.now(IST)
+
+try:
+    with st.spinner("NSE F&O shares ki activity check ho rahi hai..."):
+        quote_map = get_quotes(universe)
+except Exception as exc:
+    st.error(f"Dhan quote API error: {exc}")
+    st.info(
+        "Token validity, Dhan API access aur quote API response "
+        "check karein. Credentials chat ya GitHub mein share na karein."
+    )
+    st.stop()
+
+if not quote_map:
+    st.error("Dhan se koi valid NSE equity quote nahi mila.")
+    st.stop()
+
+quotes = pd.DataFrame(list(quote_map.values()))
+quotes = quotes.merge(
+    universe[["symbol", "security_id", "sector"]],
+    on="security_id",
+    how="left",
+    suffixes=("", "_master"),
 )
 
-breadth = st.sidebar.selectbox(
-    "NSE Advance–Decline bias",
-    [
-        "Not available",
-        "Advances > Declines (Buy bias)",
-        "Declines > Advances (Sell bias)",
-        "Advances = Declines (Neutral)"
-    ]
+quotes["symbol"] = quotes["symbol"].fillna("")
+quotes["sector"] = quotes["sector"].fillna("Other")
+quotes = quotes[quotes["symbol"] != ""].copy()
+
+# Track cumulative volume between app refreshes.
+# Delta volume is a better measure of current activity than
+# total volume alone. On the first sample, use traded turnover.
+if "previous_volumes" not in st.session_state:
+    st.session_state.previous_volumes = {}
+
+previous = st.session_state.previous_volumes
+deltas = []
+
+for _, row in quotes.iterrows():
+    sid = int(row["security_id"])
+    current_volume = int(row["volume"])
+    old_volume = previous.get(sid)
+
+    if old_volume is None or current_volume < old_volume:
+        delta = 0
+    else:
+        delta = current_volume - old_volume
+
+    deltas.append(delta)
+
+quotes["volume_delta"] = deltas
+
+# Save the current cumulative volume for the next refresh.
+st.session_state.previous_volumes = {
+    int(row["security_id"]): int(row["volume"])
+    for _, row in quotes.iterrows()
+}
+
+# Value traded in the most recent interval.
+quotes["interval_turnover"] = (
+    quotes["volume_delta"] * quotes["ltp"]
 )
 
-st.sidebar.info(
-    "Advance–Decline abhi manual setting hai; "
-    "automatic NSE breadth feed connected nahi hai."
+# Fallback ranking for the first sample or when no volume
+# has changed since the last refresh.
+quotes["cumulative_turnover"] = quotes["volume"] * quotes["ltp"]
+
+has_activity = quotes["volume_delta"].sum() > 0
+
+if has_activity:
+    quotes["activity_score"] = quotes["interval_turnover"]
+    ranking_method = "Recent traded activity (volume change)"
+else:
+    quotes["activity_score"] = quotes["cumulative_turnover"]
+    ranking_method = "Cumulative traded turnover (initial/fallback)"
+
+# Rank all eligible NSE F&O underlying shares and retain only 10.
+top10 = (
+    quotes.sort_values(
+        ["activity_score", "volume", "last_quantity"],
+        ascending=False,
+    )
+    .head(10)
+    .copy()
+    .reset_index(drop=True)
 )
 
-st.subheader("1. Watchlist")
-st.write(
-    "Ye starting symbols hain. Highest market activity ke basis "
-    "par automatic ranking abhi enabled nahi hai."
-)
-st.dataframe(
-    pd.DataFrame({"Symbol": WATCHLIST}),
-    use_container_width=True,
-    hide_index=True
-)
+if top10.empty:
+    st.error("Top 10 ke liye valid quotes available nahi hain.")
+    st.stop()
 
-st.subheader("2. Security IDs")
+top10.insert(0, "rank", range(1, len(top10) + 1))
 
-if st.button("Find Security IDs Automatically"):
-    try:
-        with st.spinner("Dhan security master load ho raha hai..."):
-            ids = get_security_ids()
-
-        result = pd.DataFrame([
-            {
-                "Symbol": symbol,
-                "Security ID": ids.get(symbol, "NOT FOUND")
-            }
-            for symbol in WATCHLIST
-        ])
-
-        st.dataframe(result, use_container_width=True, hide_index=True)
-        found = sum(ids.get(s) is not None for s in WATCHLIST)
-        st.success(f"{found}/{len(WATCHLIST)} symbols ke IDs mile.")
-
-    except Exception as exc:
-        st.error(f"Security ID error: {exc}")
-
-
-st.subheader("3. Scan 5-minute candles")
-
-uploaded = None
-csv_df = None
-
-if mode == "Upload Candle CSV":
-    uploaded = st.file_uploader(
-        "CSV upload karein: symbol, open, high, low, close; volume optional",
-        type=["csv"]
-    )
-
-    if uploaded is not None:
-        try:
-            csv_df = pd.read_csv(uploaded)
-            csv_df.columns = [
-                str(c).strip().lower() for c in csv_df.columns
-            ]
-
-            if "symbol" not in csv_df.columns:
-                st.error("CSV mein symbol column zaroori hai.")
-                csv_df = None
-
-        except Exception as exc:
-            st.error(f"CSV read error: {exc}")
-            csv_df = None
-
-
-if st.button("Refresh Scanner", type="primary"):
-    client = None
-    ids = {}
-    results = []
-
-    if mode == "Dhan API":
-        try:
-            client = get_dhan_client()
-            ids = get_security_ids()
-        except Exception as exc:
-            st.error(f"Dhan connection error: {exc}")
-            st.stop()
-
-    if mode == "Upload Candle CSV" and csv_df is None:
-        st.warning("Pehle valid Candle CSV upload karein.")
-        st.stop()
-
-    progress = st.progress(0)
-
-    for i, symbol in enumerate(WATCHLIST):
-        security_id = ids.get(symbol, "NOT FOUND")
-
-        try:
-            if mode == "Dhan API":
-                if security_id == "NOT FOUND":
-                    raise ValueError(
-                        "Security ID nahi mili. Trading symbol verify karein."
-                    )
-
-                candles = fetch_candles(client, security_id)
-
-            else:
-                part = csv_df[
-                    csv_df["symbol"].astype(str).str.strip().str.upper()
-                    == symbol
-                ].copy()
-
-                for col in ["open", "high", "low", "close"]:
-                    if col not in part.columns:
-                        raise ValueError(
-                            f"CSV mein {col} column missing hai."
-                        )
-
-                if "volume" not in part.columns:
-                    part["volume"] = 0
-
-                candles = part
-
-            if candles.empty:
-                raise ValueError("Koi candle nahi mili.")
-
-            signal = candle_signal(candles)
-
-            if breadth.startswith("Advances >") and signal == "SELL":
-                signal = "WAIT"
-            elif breadth.startswith("Declines >") and signal == "BUY":
-                signal = "WAIT"
-            elif breadth.startswith("Advances =") and signal in ["BUY", "SELL"]:
-                signal = "WAIT"
-
-            results.append({
-                "Symbol": symbol,
-                "Security ID": security_id,
-                "Last Close": round(float(candles.iloc[-1]["close"]), 2),
-                "Signal": signal,
-                "Candles": len(candles),
-                "Status": "OK"
-            })
-
-        except Exception as exc:
-            results.append({
-                "Symbol": symbol,
-                "Security ID": security_id,
-                "Last Close": None,
-                "Signal": "NO SIGNAL",
-                "Candles": 0,
-                "Status": str(exc)[:250]
-            })
-
-        progress.progress((i + 1) / len(WATCHLIST))
-
-    st.session_state.scan_results = pd.DataFrame(results)
-    st.success("Scan complete. Koi real order place nahi hua.")
-
-
-if not st.session_state.scan_results.empty:
-    st.subheader("Scanner Results")
-    st.dataframe(
-        st.session_state.scan_results,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.download_button(
-        "Download scan results CSV",
-        data=st.session_state.scan_results.to_csv(index=False).encode("utf-8"),
-        file_name="scanner_results.csv",
-        mime="text/csv"
-    )
-
-
-st.subheader("4. Paper Trade Entry")
-
-with st.form("paper_trade_form"):
-    symbol = st.selectbox("Symbol", WATCHLIST)
-    side = st.selectbox("Side", ["BUY", "SELL"])
-    quantity = st.number_input(
-        "Quantity", min_value=1, max_value=100000, value=1, step=1
-    )
-    entry = st.number_input(
-        "Simulated entry price (₹)", min_value=0.01, value=100.0, step=0.05
-    )
-    stop_loss = st.number_input(
-        "Stop loss (₹)", min_value=0.0, value=95.0, step=0.05
-    )
-    target = st.number_input(
-        "Target (₹)", min_value=0.0, value=110.0, step=0.05
-    )
-
-    submitted = st.form_submit_button("Record Paper Trade")
-
-    if submitted:
-        st.session_state.paper_trades.append({
-            "Time": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
-            "Symbol": symbol,
-            "Side": side,
-            "Quantity": int(quantity),
-            "Entry": float(entry),
-            "Stop Loss": float(stop_loss),
-            "Target": float(target),
-            "Type": "PAPER ONLY"
-        })
-        st.success("Paper trade record save hua. Real order nahi bheja.")
-
-
-if st.session_state.paper_trades:
-    st.subheader("Paper Trade Journal")
-    trades = pd.DataFrame(st.session_state.paper_trades)
-    st.dataframe(trades, use_container_width=True, hide_index=True)
-
-    st.download_button(
-        "Download paper journal CSV",
-        data=trades.to_csv(index=False).encode("utf-8"),
-        file_name="paper_trade_journal.csv",
-        mime="text/csv"
-    )
-
-    if st.button("Clear Paper Trade Journal"):
-        st.session_state.paper_trades = []
-        st.rerun()
-
-
-st.divider()
 st.caption(
-    "No demo data. Signals only use API/CSV candles. "
-    "Paper trading only; no automatic or real orders. "
-    "Automatic breadth and activity ranking are not implemented."
+    f"Time: {now.strftime('%d-%b-%Y %H:%M:%S')} IST · "
+    f"Universe checked: {len(quotes)} · "
+    f"Displayed: {len(top10)} · Ranking: {ranking_method}"
 )
+
+if not market_is_open():
+    st.warning(
+        "Regular market hours ke bahar hain. Data stale ho sakta hai; "
+        "is waqt live activity ranking par bharosa na karein."
+    )
+
+# =====================================================
+# SUMMARY: ONLY THE SELECTED TOP 10
+# =====================================================
+advances = int((top10["change_pct"] > 0).sum())
+declines = int((top10["change_pct"] < 0).sum())
+unchanged = int((top10["change_pct"] == 0).sum())
+
+a, b, c, d = st.columns(4)
+a.metric("Top 10 Stocks", len(top10))
+b.metric("Advances", advances)
+c.metric("Declines", declines)
+d.metric("Unchanged", unchanged)
+
+if advances > declines:
+    st.success("Top 10 breadth: BUY SIDE bias (advances > declines)")
+elif declines > advances:
+    st.error("Top 10 breadth: SELL SIDE bias (declines > advances)")
+else:
+    st.info("Top 10 breadth: NEUTRAL")
+
+# =====================================================
+# TOP 10 TABLE
+# =====================================================
+st.subheader("🏆 Top 10 Most Active NSE F&O Shares")
+
+display = top10[
+    [
+        "rank", "symbol", "sector", "ltp", "change_pct",
+        "volume", "volume_delta", "interval_turnover",
+        "open", "high", "low",
+    ]
+].copy()
+
+st.dataframe(
+    display,
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "rank": st.column_config.NumberColumn("Rank"),
+        "symbol": st.column_config.TextColumn("Symbol"),
+        "sector": st.column_config.TextColumn("Sector"),
+        "ltp": st.column_config.NumberColumn("LTP", format="₹ %.2f"),
+        "change_pct": st.column_config.NumberColumn(
+            "Change %", format="%.2f%%"
+        ),
+        "volume": st.column_config.NumberColumn("Day Volume"),
+        "volume_delta": st.column_config.NumberColumn(
+            f"Volume Change (~{REFRESH_SECONDS}s)"
+        ),
+        "interval_turnover": st.column_config.NumberColumn(
+            "Interval Turnover", format="₹ %.0f"
+        ),
+        "open": st.column_config.NumberColumn("Open", format="₹ %.2f"),
+        "high": st.column_config.NumberColumn("High", format="₹ %.2f"),
+        "low": st.column_config.NumberColumn("Low", format="₹ %.2f"),
+    },
+)
+
+# =====================================================
+# SECTOR HEATMAP - TOP 10 ONLY
+# =====================================================
+st.subheader("🔥 Sector Heatmap (Top 10 Only)")
+
+sector_df = (
+    top10.groupby("sector")
+    .agg(
+        avg_change=("change_pct", "mean"),
+        stocks=("symbol", "count"),
+        advances=("change_pct", lambda s: int((s > 0).sum())),
+        declines=("change_pct", lambda s: int((s < 0).sum())),
+    )
+    .reset_index()
+    .sort_values("avg_change", ascending=False)
+)
+
+fig = px.treemap(
+    sector_df,
+    path=["sector"],
+    values="stocks",
+    color="avg_change",
+    color_continuous_scale=[
+        "#c62828", "#ef5350", "#263238", "#66bb6a", "#1b5e20"
+    ],
+    color_continuous_midpoint=0,
+    hover_data=["avg_change", "stocks", "advances", "declines"],
+)
+fig.update_traces(
+    texttemplate="%{label}<br>%{color:.2f}%<br>%{value} stock(s)"
+)
+fig.update_layout(
+    height=400,
+    margin=dict(t=10, l=5, r=5, b=5),
+)
+st.plotly_chart(fig, use_container_width=True)
+
+# =====================================================
+# TOP 10 GAINERS AND LOSERS
+# =====================================================
+st.subheader("🚀 Top 10 ke Gainers aur Losers")
+left, right = st.columns(2)
+
+with left:
+    st.markdown("#### 🟢 Gainers")
+    st.dataframe(
+        top10.sort_values("change_pct", ascending=False)
+        [["symbol", "ltp", "change_pct"]].head(10),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "ltp": st.column_config.NumberColumn("LTP", format="₹ %.2f"),
+            "change_pct": st.column_config.NumberColumn(
+                "Change %", format="%.2f%%"
+            ),
+        },
+    )
+
+with right:
+    st.markdown("#### 🔴 Losers")
+    st.dataframe(
+        top10.sort_values("change_pct", ascending=True)
+        [["symbol", "ltp", "change_pct"]].head(10),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "ltp": st.column_config.NumberColumn("LTP", format="₹ %.2f"),
+            "change_pct": st.column_config.NumberColumn(
+                "Change %", format="%.2f%%"
+            ),
+        },
+    )
+
+# =====================================================
+# CHANGE % CHART - TOP 10 ONLY
+# =====================================================
+st.subheader("📈 Top 10 Share Performance")
+
+bar = px.bar(
+    top10.sort_values("change_pct"),
+    x="change_pct",
+    y="symbol",
+    orientation="h",
+    color="change_pct",
+    color_continuous_scale=[
+        "#c62828", "#ef5350", "#777777", "#66bb6a", "#1b5e20"
+    ],
+    color_continuous_midpoint=0,
+    labels={"change_pct": "Change (%)", "symbol": "Stock"},
+)
+bar.update_layout(
+    height=420,
+    margin=dict(t=10, l=5, r=5, b=5),
+)
+st.plotly_chart(bar, use_container_width=True)
+
+# =====================================================
+# STATUS
+# =====================================================
+st.subheader("🛰️ Scanner Status")
+s1, s2, s3 = st.columns(3)
+s1.metric("Quote Source", "Dhan REST API")
+s2.metric("Refresh", f"{REFRESH_SECONDS} seconds")
+s3.metric(
+    "Market Session",
+    "OPEN" if market_is_open() else "CLOSED / OUTSIDE HOURS",
+)
+
+st.caption(
+    "Activity ranking uses interval volume change when available; "
+    "the initial sample uses cumulative traded turnover. "
+    "This is a ranking of underlying NSE equity shares, not F&O "
+    "contract turnover or an official NSE ranking. "
+    "Market breadth is calculated only from these 10 shares. "
+    "The app does not place real orders and is not financial advice."
+)
+
+# =====================================================
+# AUTO REFRESH
+# =====================================================
+if auto_refresh:
+    time.sleep(REFRESH_SECONDS)
+    st.rerun()
