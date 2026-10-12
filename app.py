@@ -315,4 +315,3 @@ st.caption(
     "Signals are not guaranteed to be profitable. "
     "Live Dhan API integration is not enabled in this version."
 )
-```
