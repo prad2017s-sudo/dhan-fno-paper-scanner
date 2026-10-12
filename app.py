@@ -1,7 +1,7 @@
 
 import streamlit as st
 import pandas as pd
-from datetime import datetime, date
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dhanhq import DhanContext, dhanhq
 
@@ -13,14 +13,13 @@ st.set_page_config(
 
 IST = ZoneInfo("Asia/Kolkata")
 
-# Watchlist: starting list only, not automatically ranked by activity.
 WATCHLIST = [
     "RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN", "INFY",
     "TCS", "AXISBANK", "TATAMOTORS", "LT", "BHARTIARTL"
 ]
 
 st.title("📊 NSE F&O Paper Trading Scanner")
-st.caption("5-minute candles | Dhan API | Paper trades only")
+st.caption("5-minute candles | No demo data | Paper trading only")
 
 if "paper_trades" not in st.session_state:
     st.session_state.paper_trades = []
@@ -35,95 +34,71 @@ def get_dhan_client():
 
     if not client_id or not access_token:
         raise ValueError(
-            "DHAN_CLIENT_ID aur DHAN_ACCESS_TOKEN "
-            "Streamlit Secrets mein set karein."
+            "Streamlit Secrets mein DHAN_CLIENT_ID aur "
+            "DHAN_ACCESS_TOKEN set karein."
         )
 
     context = DhanContext(client_id, access_token)
     return dhanhq(context)
 
 
-def normalize_columns(df):
-    df = df.copy()
-    df.columns = [
-        str(column).strip().upper()
-        for column in df.columns
-    ]
-    return df
-
-
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_security_master():
-    # Dhan security master: compact format
+    # Dhan SDK ka security master
     client = get_dhan_client()
     df = client.fetch_security_list("compact")
 
     if isinstance(df, dict):
-        if "data" in df:
-            df = df["data"]
-        else:
-            raise ValueError(
-                "Dhan security master ka response samajh nahi aaya."
-            )
+        df = df.get("data", df)
 
     if not isinstance(df, pd.DataFrame):
         df = pd.DataFrame(df)
 
-    return normalize_columns(df)
+    df.columns = [str(c).strip().upper() for c in df.columns]
+    return df
 
 
-def get_nse_equity_ids():
+def get_security_ids():
     df = load_security_master()
 
-    exchange_col = "SEM_EXM_EXCH_ID"
-    segment_col = "SEM_SEGMENT"
-    security_col = "SEM_SMST_SECURITY_ID"
+    required = [
+        "SEM_EXM_EXCH_ID",
+        "SEM_SEGMENT",
+        "SEM_SMST_SECURITY_ID"
+    ]
 
-    required = [exchange_col, segment_col, security_col]
-    missing = [col for col in required if col not in df.columns]
-
+    missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(
             "Security master columns missing: "
             + ", ".join(missing)
-            + ". Available columns: "
+            + ". Available: "
             + ", ".join(df.columns.astype(str))
         )
 
-    # Prefer the exact exchange trading symbol.
-    symbol_candidates = [
-        "SEM_TRADING_SYMBOL",
-        "SEM_CUSTOM_SYMBOL",
-        "SM_SYMBOL_NAME",
-    ]
-
     symbol_col = next(
-        (col for col in symbol_candidates if col in df.columns),
+        (
+            c for c in [
+                "SEM_TRADING_SYMBOL",
+                "SEM_CUSTOM_SYMBOL",
+                "SM_SYMBOL_NAME"
+            ]
+            if c in df.columns
+        ),
         None
     )
 
-    if symbol_col is None:
-        raise ValueError(
-            "Trading symbol column nahi mila. Columns: "
-            + ", ".join(df.columns.astype(str))
-        )
+    if not symbol_col:
+        raise ValueError("Trading symbol column nahi mila.")
 
-    df[exchange_col] = (
-        df[exchange_col].astype(str).str.strip().str.upper()
-    )
-    df[segment_col] = (
-        df[segment_col].astype(str).str.strip().str.upper()
-    )
-    df[symbol_col] = (
-        df[symbol_col].astype(str).str.strip().str.upper()
-    )
+    for col in ["SEM_EXM_EXCH_ID", "SEM_SEGMENT", symbol_col]:
+        df[col] = df[col].astype(str).str.strip().str.upper()
 
     df = df[
-        (df[exchange_col] == "NSE")
-        & (df[segment_col] == "E")
+        (df["SEM_EXM_EXCH_ID"] == "NSE")
+        & (df["SEM_SEGMENT"] == "E")
     ].copy()
 
-    # If instrument type is available, restrict to equities.
     if "SEM_INSTRUMENT_NAME" in df.columns:
         instrument = (
             df["SEM_INSTRUMENT_NAME"]
@@ -131,86 +106,62 @@ def get_nse_equity_ids():
         )
         df = df[instrument.isin(["EQUITY", "EQ"])]
 
-    df[security_col] = df[security_col].astype(str).str.strip()
+    df["SEM_SMST_SECURITY_ID"] = (
+        df["SEM_SMST_SECURITY_ID"].astype(str).str.strip()
+    )
 
-    df = df[
-        df[symbol_col].notna()
-        & (df[symbol_col] != "")
-        & (df[security_col] != "")
-        & (df[security_col].str.lower() != "nan")
-    ]
-
-    # Prefer exact trading symbol; aliases are used only as fallbacks.
-    result = {}
-    for _, row in df.iterrows():
-        symbol = row[symbol_col]
-        security_id = row[security_col]
-        if symbol not in result:
-            result[symbol] = security_id
-
-    return result
-
-
-def response_to_dataframe(response):
-    if isinstance(response, pd.DataFrame):
-        return response.copy()
-
-    if not isinstance(response, dict):
-        raise ValueError("Dhan candle response dictionary nahi hai.")
-
-    if response.get("status") == "failure":
-        raise ValueError(
-            str(response.get("remarks", "Dhan API request failed"))
-        )
-
-    data = response.get("data", response)
-
-    if not isinstance(data, dict):
-        raise ValueError("Dhan candle data ka format galat hai.")
-
-    # Dhan returns OHLCV arrays in separate keys.
-    if "close" in data and isinstance(data["close"], (list, tuple)):
-        df = pd.DataFrame(data)
-    else:
-        df = pd.DataFrame(data)
-
-    if df.empty:
-        return df
-
-    df.columns = [str(c).strip().lower() for c in df.columns]
-    return df
+    return dict(
+        zip(df[symbol_col], df["SEM_SMST_SECURITY_ID"])
+    )
 
 
 def fetch_candles(client, security_id):
-    today = datetime.now(IST).date().isoformat()
+    now = datetime.now(IST)
+
+    # Recent date range allows the API to return recent candles.
+    end_date = now.date()
+    start_date = end_date - timedelta(days=7)
 
     response = client.intraday_minute_data(
         security_id=str(security_id),
         exchange_segment="NSE_EQ",
         instrument_type="EQUITY",
-        from_date=today,
-        to_date=today,
+        from_date=start_date.isoformat(),
+        to_date=end_date.isoformat(),
         interval=5,
     )
 
-    df = response_to_dataframe(response)
+    if not isinstance(response, dict):
+        raise ValueError(
+            "Unexpected API response: " + str(response)[:500]
+        )
 
-    if df.empty:
-        return df
+    if response.get("status") == "failure":
+        raise ValueError(
+            "Dhan API failure: "
+            + str(response.get("remarks", response))[:500]
+        )
 
-    # Normalize possible timestamp field names.
-    if "timestamp" not in df.columns:
-        for candidate in ["start_time", "datetime", "time"]:
-            if candidate in df.columns:
-                df = df.rename(columns={candidate: "timestamp"})
-                break
+    data = response.get("data", response)
+
+    if not isinstance(data, dict):
+        raise ValueError("Dhan candle response format galat hai.")
+
+    if not data or not isinstance(data.get("close"), (list, tuple)):
+        raise ValueError(
+            "Dhan ne candle data nahi diya. API response: "
+            + str(response)[:700]
+        )
+
+    df = pd.DataFrame(data)
+    df.columns = [str(c).strip().lower() for c in df.columns]
 
     required = ["open", "high", "low", "close"]
     missing = [c for c in required if c not in df.columns]
 
     if missing:
         raise ValueError(
-            "Candle fields missing: " + ", ".join(missing)
+            "Candle columns missing: " + ", ".join(missing)
         )
 
     for col in required:
@@ -225,42 +176,10 @@ def fetch_candles(client, security_id):
     return df.tail(30).reset_index(drop=True)
 
 
-def demo_candles(symbol):
-    # Clearly simulated values; not market data.
-    import random
-
-    rng = random.Random(
-        sum(ord(ch) for ch in symbol)
-        + datetime.now(IST).minute
-    )
-
-    price = rng.uniform(200, 3000)
-    rows = []
-
-    for i in range(10):
-        opening = price
-        change = rng.uniform(-0.012, 0.012)
-        closing = max(1, opening * (1 + change))
-        high = max(opening, closing) * (1 + rng.uniform(0, 0.004))
-        low = min(opening, closing) * (1 - rng.uniform(0, 0.004))
-
-        rows.append({
-            "timestamp": f"Demo candle {i + 1}",
-            "open": round(opening, 2),
-            "high": round(high, 2),
-            "low": round(low, 2),
-            "close": round(closing, 2),
-            "volume": rng.randint(1000, 50000),
-        })
-
-        price = closing
-
-    return pd.DataFrame(rows)
-
-
-def make_signal(df):
+def candle_signal(df):
+    # Signals require actual uploaded/API candles only.
     if df is None or len(df) < 3:
-        return "WAIT"
+        return "NO SIGNAL"
 
     previous = df.iloc[-2]
     current = df.iloc[-1]
@@ -273,12 +192,12 @@ def make_signal(df):
     return "WAIT"
 
 
-# Sidebar controls
+# Sidebar
 st.sidebar.header("Scanner Settings")
 
 mode = st.sidebar.radio(
     "Data source",
-    ["Demo Mode", "Dhan API", "Upload Candle CSV"]
+    ["Dhan API", "Upload Candle CSV"]
 )
 
 breadth = st.sidebar.selectbox(
@@ -287,21 +206,20 @@ breadth = st.sidebar.selectbox(
         "Not available",
         "Advances > Declines (Buy bias)",
         "Declines > Advances (Sell bias)",
-        "Advances = Declines (Neutral)",
+        "Advances = Declines (Neutral)"
     ]
 )
 
 st.sidebar.info(
-    "Advance–Decline value abhi manual selection hai; "
-    "automatic NSE breadth feed abhi connected nahi hai."
+    "Advance–Decline abhi manual setting hai; "
+    "automatic NSE breadth feed connected nahi hai."
 )
 
 st.subheader("1. Watchlist")
 st.write(
-    "Ye 10 starting symbols hain. Inhe highest market activity "
-    "ke basis par automatically rank nahi kiya ja raha."
+    "Ye starting symbols hain. Highest market activity ke basis "
+    "par automatic ranking abhi enabled nahi hai."
 )
-
 st.dataframe(
     pd.DataFrame({"Symbol": WATCHLIST}),
     use_container_width=True,
@@ -310,29 +228,22 @@ st.dataframe(
 
 st.subheader("2. Security IDs")
 
-if st.button("Find Security IDs Automatically", type="primary"):
+if st.button("Find Security IDs Automatically"):
     try:
         with st.spinner("Dhan security master load ho raha hai..."):
-            ids = get_nse_equity_ids()
+            ids = get_security_ids()
 
-        rows = []
-        for symbol in WATCHLIST:
-            rows.append({
+        result = pd.DataFrame([
+            {
                 "Symbol": symbol,
-                "Security ID": ids.get(symbol, "NOT FOUND"),
-            })
+                "Security ID": ids.get(symbol, "NOT FOUND")
+            }
+            for symbol in WATCHLIST
+        ])
 
-        id_df = pd.DataFrame(rows)
-        st.dataframe(id_df, use_container_width=True, hide_index=True)
-
+        st.dataframe(result, use_container_width=True, hide_index=True)
         found = sum(ids.get(s) is not None for s in WATCHLIST)
         st.success(f"{found}/{len(WATCHLIST)} symbols ke IDs mile.")
-
-        if found < len(WATCHLIST):
-            st.warning(
-                "Jo symbols NOT FOUND hain, unke liye security master "
-                "mein available trading symbols verify karne honge."
-            )
 
     except Exception as exc:
         st.error(f"Security ID error: {exc}")
@@ -341,132 +252,113 @@ if st.button("Find Security IDs Automatically", type="primary"):
 st.subheader("3. Scan 5-minute candles")
 
 uploaded = None
+csv_df = None
+
 if mode == "Upload Candle CSV":
     uploaded = st.file_uploader(
-        "CSV upload karein (symbol, open, high, low, close; volume optional)",
+        "CSV upload karein: symbol, open, high, low, close; volume optional",
         type=["csv"]
     )
 
-if st.button("Refresh Scanner"):
-    output = []
-    client = None
-    ids = {}
-
-    if mode == "Dhan API":
-        try:
-            client = get_dhan_client()
-            ids = get_nse_equity_ids()
-        except Exception as exc:
-            st.error(f"Dhan connection/security master error: {exc}")
-            st.stop()
-
-    if mode == "Upload Candle CSV":
-        if uploaded is None:
-            st.warning("Pehle candle CSV upload karein.")
-            st.stop()
-
+    if uploaded is not None:
         try:
             csv_df = pd.read_csv(uploaded)
             csv_df.columns = [
                 str(c).strip().lower() for c in csv_df.columns
             ]
+
             if "symbol" not in csv_df.columns:
-                st.error("CSV mein 'symbol' column zaroori hai.")
-                st.stop()
+                st.error("CSV mein symbol column zaroori hai.")
+                csv_df = None
+
         except Exception as exc:
             st.error(f"CSV read error: {exc}")
+            csv_df = None
+
+
+if st.button("Refresh Scanner", type="primary"):
+    client = None
+    ids = {}
+    results = []
+
+    if mode == "Dhan API":
+        try:
+            client = get_dhan_client()
+            ids = get_security_ids()
+        except Exception as exc:
+            st.error(f"Dhan connection error: {exc}")
             st.stop()
+
+    if mode == "Upload Candle CSV" and csv_df is None:
+        st.warning("Pehle valid Candle CSV upload karein.")
+        st.stop()
 
     progress = st.progress(0)
 
-    for index, symbol in enumerate(WATCHLIST):
+    for i, symbol in enumerate(WATCHLIST):
+        security_id = ids.get(symbol, "NOT FOUND")
+
         try:
-            if mode == "Demo Mode":
-                candles = demo_candles(symbol)
-                security_id = "DEMO"
-
-            elif mode == "Dhan API":
-                security_id = ids.get(symbol)
-
-                if not security_id:
-                    output.append({
-                        "Symbol": symbol,
-                        "Security ID": "NOT FOUND",
-                        "Last Close": None,
-                        "Signal": "NO DATA",
-                        "Candles": 0,
-                        "Status": "Security ID nahi mili",
-                    })
-                    progress.progress((index + 1) / len(WATCHLIST))
-                    continue
+            if mode == "Dhan API":
+                if security_id == "NOT FOUND":
+                    raise ValueError(
+                        "Security ID nahi mili. Trading symbol verify karein."
+                    )
 
                 candles = fetch_candles(client, security_id)
 
             else:
                 part = csv_df[
-                    csv_df["symbol"].astype(str).str.upper().str.strip()
+                    csv_df["symbol"].astype(str).str.strip().str.upper()
                     == symbol
                 ].copy()
 
                 for col in ["open", "high", "low", "close"]:
                     if col not in part.columns:
-                        raise ValueError(f"CSV mein {col} column missing hai.")
+                        raise ValueError(
+                            f"CSV mein {col} column missing hai."
+                        )
 
                 if "volume" not in part.columns:
                     part["volume"] = 0
 
                 candles = part
 
-                if "timestamp" not in candles.columns:
-                    candles["timestamp"] = range(len(candles))
-
-                security_id = "CSV"
-
             if candles.empty:
-                output.append({
-                    "Symbol": symbol,
-                    "Security ID": security_id,
-                    "Last Close": None,
-                    "Signal": "NO DATA",
-                    "Candles": 0,
-                    "Status": "Koi candle nahi mili",
-                })
-            else:
-                signal = make_signal(candles)
+                raise ValueError("Koi candle nahi mili.")
 
-                # Optional manually selected breadth filter.
-                if breadth.startswith("Advances >") and signal == "SELL":
-                    signal = "WAIT"
-                elif breadth.startswith("Declines >") and signal == "BUY":
-                    signal = "WAIT"
-                elif breadth.startswith("Advances =") and signal != "WAIT":
-                    signal = "WAIT"
+            signal = candle_signal(candles)
 
-                output.append({
-                    "Symbol": symbol,
-                    "Security ID": security_id,
-                    "Last Close": round(float(candles.iloc[-1]["close"]), 2),
-                    "Signal": signal,
-                    "Candles": len(candles),
-                    "Status": "DEMO DATA" if mode == "Demo Mode" else "OK",
-                })
+            if breadth.startswith("Advances >") and signal == "SELL":
+                signal = "WAIT"
+            elif breadth.startswith("Declines >") and signal == "BUY":
+                signal = "WAIT"
+            elif breadth.startswith("Advances =") and signal in ["BUY", "SELL"]:
+                signal = "WAIT"
 
-        except Exception as exc:
-            output.append({
+            results.append({
                 "Symbol": symbol,
-                "Security ID": ids.get(symbol, "—") if mode == "Dhan API" else "—",
-                "Last Close": None,
-                "Signal": "ERROR",
-                "Candles": 0,
-                "Status": str(exc)[:180],
+                "Security ID": security_id,
+                "Last Close": round(float(candles.iloc[-1]["close"]), 2),
+                "Signal": signal,
+                "Candles": len(candles),
+                "Status": "OK"
             })
 
-        progress.progress((index + 1) / len(WATCHLIST))
+        except Exception as exc:
+            results.append({
+                "Symbol": symbol,
+                "Security ID": security_id,
+                "Last Close": None,
+                "Signal": "NO SIGNAL",
+                "Candles": 0,
+                "Status": str(exc)[:250]
+            })
 
-    result_df = pd.DataFrame(output)
-    st.session_state.scan_results = result_df
+        progress.progress((i + 1) / len(WATCHLIST))
 
-    st.success("Scan complete. Koi real order place nahi kiya gaya.")
+    st.session_state.scan_results = pd.DataFrame(results)
+    st.success("Scan complete. Koi real order place nahi hua.")
 
 
 if not st.session_state.scan_results.empty:
@@ -477,11 +369,10 @@ if not st.session_state.scan_results.empty:
         hide_index=True
     )
 
-    csv_bytes = st.session_state.scan_results.to_csv(index=False).encode("utf-8")
     st.download_button(
         "Download scan results CSV",
-        data=csv_bytes,
-        file_name="paper_scanner_results.csv",
+        data=st.session_state.scan_results.to_csv(index=False).encode("utf-8"),
+        file_name="scanner_results.csv",
         mime="text/csv"
     )
 
@@ -494,23 +385,14 @@ with st.form("paper_trade_form"):
     quantity = st.number_input(
         "Quantity", min_value=1, max_value=100000, value=1, step=1
     )
-    entry_price = st.number_input(
-        "Simulated entry price (₹)",
-        min_value=0.01,
-        value=100.0,
-        step=0.05
+    entry = st.number_input(
+        "Simulated entry price (₹)", min_value=0.01, value=100.0, step=0.05
     )
     stop_loss = st.number_input(
-        "Stop loss (₹)",
-        min_value=0.0,
-        value=95.0,
-        step=0.05
+        "Stop loss (₹)", min_value=0.0, value=95.0, step=0.05
     )
     target = st.number_input(
-        "Target (₹)",
-        min_value=0.0,
-        value=110.0,
-        step=0.05
+        "Target (₹)", min_value=0.0, value=110.0, step=0.05
     )
 
     submitted = st.form_submit_button("Record Paper Trade")
@@ -521,22 +403,22 @@ with st.form("paper_trade_form"):
             "Symbol": symbol,
             "Side": side,
             "Quantity": int(quantity),
-            "Entry": float(entry_price),
+            "Entry": float(entry),
             "Stop Loss": float(stop_loss),
             "Target": float(target),
-            "Mode": "PAPER ONLY",
+            "Type": "PAPER ONLY"
         })
-        st.success("Paper trade record save ho gaya. Real order nahi bheja.")
+        st.success("Paper trade record save hua. Real order nahi bheja.")
 
 
 if st.session_state.paper_trades:
     st.subheader("Paper Trade Journal")
-    trades_df = pd.DataFrame(st.session_state.paper_trades)
-    st.dataframe(trades_df, use_container_width=True, hide_index=True)
+    trades = pd.DataFrame(st.session_state.paper_trades)
+    st.dataframe(trades, use_container_width=True, hide_index=True)
 
     st.download_button(
         "Download paper journal CSV",
-        data=trades_df.to_csv(index=False).encode("utf-8"),
+        data=trades.to_csv(index=False).encode("utf-8"),
         file_name="paper_trade_journal.csv",
         mime="text/csv"
     )
@@ -548,6 +430,7 @@ if st.session_state.paper_trades:
 
 st.divider()
 st.caption(
-    "Paper trading only. Signals are simple candle-breakout examples, "
-    "not financial advice. Demo data is simulated. No automatic orders."
+    "No demo data. Signals only use API/CSV candles. "
+    "Paper trading only; no automatic or real orders. "
+    "Automatic breadth and activity ranking are not implemented."
 )
