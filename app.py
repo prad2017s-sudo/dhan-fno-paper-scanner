@@ -12,7 +12,7 @@ from dhanhq import DhanContext, MarketFeed
 
 
 st.set_page_config(
-    page_title="Dhan Live BUY SELL Scanner",
+    page_title="Dhan Live Scanner",
     page_icon="📈",
     layout="wide",
 )
@@ -43,151 +43,185 @@ def now_ist():
 
 
 def market_is_open():
-    now = now_ist()
+    n = now_ist()
     return (
-        now.weekday() < 5
-        and dt_time(9, 15) <= now.time() <= dt_time(15, 15)
+        n.weekday() < 5
+        and dt_time(9, 15) <= n.time() <= dt_time(15, 15)
     )
 
 
-class ScannerEngine:
+class Scanner:
     def __init__(self):
         self.lock = threading.RLock()
         self.direction = None
-        self.thread_started = False
-        self.status = "BUY या SELL चुनें"
-        self.logs = []
-        self.symbols = {}
+        self.status = "Starting live feed..."
+        self.started = False
+        self.records = []
+        self.items = {}
 
         for symbol, sid in WATCHLIST.items():
-            self.symbols[sid] = {
+            self.items[sid] = {
                 "symbol": symbol,
-                "last_price": None,
+                "ltp": None,
                 "last_cum_volume": None,
                 "candle": None,
                 "completed": [],
                 "baseline_min": None,
                 "baseline_ready": False,
                 "reference": None,
-                "last_signal_candle": None,
-                "error": None,
+                "signal_candle": None,
+                "feed_time": None,
             }
 
-    def choose(self, direction):
+    def start(self):
         with self.lock:
-            if self.direction != direction:
-                self.direction = direction
-                for item in self.symbols.values():
-                    item["reference"] = None
-                    item["last_signal_candle"] = None
+            if self.started:
+                return
+            self.started = True
 
-            if not self.thread_started:
-                self.thread_started = True
-                threading.Thread(
-                    target=self.run_feed,
-                    daemon=True,
-                    name="dhan-market-feed",
-                ).start()
+        threading.Thread(
+            target=self.feed_loop,
+            daemon=True,
+            name="dhan-live-feed",
+        ).start()
 
-            self.status = f"{direction} चुना गया — लाइव डेटा की प्रतीक्षा"
+    def select(self, direction):
+        with self.lock:
+            self.direction = direction
+            self.status = (
+                f"{direction} selected — waiting for valid setup"
+            )
 
-    def add_signal(self, item, direction, price, candle):
-        stamp = now_ist()
-        self.logs.append({
-            "Date": stamp.strftime("%Y-%m-%d"),
-            "Time": stamp.strftime("%H:%M:%S"),
-            "Symbol": item["symbol"],
-            "Signal": direction,
-            "Breakout Price": round(float(price), 2),
-            "Trigger Candle": candle["start"].strftime("%H:%M"),
-            "Trigger Volume": int(candle["volume"]),
-        })
-        item["last_signal_candle"] = candle["start"]
-        item["reference"] = None
+    def feed_loop(self):
+        try:
+            token = st.secrets.get(
+                "DHAN_ACCESS_TOKEN",
+                os.getenv("DHAN_ACCESS_TOKEN", ""),
+            )
+            client_id = st.secrets.get(
+                "DHAN_CLIENT_ID",
+                os.getenv("DHAN_CLIENT_ID", ""),
+            )
+        except Exception:
+            token = os.getenv("DHAN_ACCESS_TOKEN", "")
+            client_id = os.getenv("DHAN_CLIENT_ID", "")
 
-    def finish_candle(self, item, candle):
-        if candle is None:
+        if not token or not client_id:
+            with self.lock:
+                self.status = "Dhan credentials missing"
             return
 
-        item["completed"].append(candle)
-        start = candle["start"]
-
-        # Baseline केवल 9:15, 9:20 और 9:25 वाली
-        # तीन शुरुआती 5-minute candles से बनेगा.
-        if start.date() != now_ist().date():
-            return
-
-        first_three_times = {
-            dt_time(9, 15),
-            dt_time(9, 20),
-            dt_time(9, 25),
-        }
-
-        first_three = [
-            c for c in item["completed"]
-            if c["start"].date() == start.date()
-            and c["start"].time() in first_three_times
-            and c["end"] is not None
+        instruments = [
+            (MarketFeed.NSE, sid, MarketFeed.Full)
+            for sid in WATCHLIST.values()
         ]
 
-        if len(first_three) == 3 and not item["baseline_ready"]:
-            item["baseline_min"] = min(c["volume"] for c in first_three)
+        while True:
+            try:
+                context = DhanContext(client_id, token)
+                feed = MarketFeed(context, instruments, version="v2")
+
+                with self.lock:
+                    self.status = "Connecting to Dhan WebSocket..."
+
+                feed.run_forever()
+
+                with self.lock:
+                    self.status = "WebSocket connected"
+
+                while True:
+                    packet = feed.get_data()
+                    if isinstance(packet, dict):
+                        self.on_tick(packet)
+
+            except Exception as exc:
+                with self.lock:
+                    self.status = (
+                        "Feed error/reconnecting: " + str(exc)[:160]
+                    )
+                time.sleep(5)
+
+    def finish_candle(self, item, candle):
+        candle["end"] = candle["start"].replace()
+        item["completed"].append(candle)
+
+        # Use only the opening three candles: 09:15, 09:20, 09:25.
+        today = now_ist().date()
+        opening_times = {dt_time(9, 15), dt_time(9, 20), dt_time(9, 25)}
+
+        opening = [
+            c for c in item["completed"]
+            if c["start"].date() == today
+            and c["start"].time() in opening_times
+        ]
+
+        if len(opening) == 3 and not item["baseline_ready"]:
+            item["baseline_min"] = min(c["volume"] for c in opening)
             item["baseline_ready"] = True
 
-    def on_tick(self, data):
-        if not isinstance(data, dict):
-            return
+    def record_signal(self, item, direction, price, reference):
+        stamp = now_ist()
 
-        sid = str(data.get("security_id", ""))
-        if sid not in self.symbols:
+        with self.lock:
+            self.records.append({
+                "Date": stamp.strftime("%Y-%m-%d"),
+                "Time": stamp.strftime("%H:%M:%S"),
+                "Symbol": item["symbol"],
+                "Signal": direction,
+                "Breakout Price": round(float(price), 2),
+                "Trigger Candle": reference["start"].strftime("%H:%M"),
+                "Trigger Volume": int(reference["volume"]),
+            })
+
+        item["signal_candle"] = item["candle"]["start"]
+        item["reference"] = None
+
+    def on_tick(self, packet):
+        sid = str(packet.get("security_id", ""))
+        if sid not in self.items:
             return
 
         try:
-            price = float(data.get("LTP"))
+            price = float(packet.get("LTP"))
+            cum_volume = int(packet.get("volume", 0))
         except (TypeError, ValueError):
             return
 
         if price <= 0:
             return
 
-        item = self.symbols[sid]
         stamp = now_ist()
+        item = self.items[sid]
 
-        # Quote/Full packet में volume पूरे दिन का cumulative volume है.
-        # Candle volume के लिए केवल positive volume differences जोड़ें.
-        try:
-            cum_volume = int(data.get("volume", 0))
-        except (TypeError, ValueError):
-            cum_volume = 0
+        with self.lock:
+            item["ltp"] = price
+            item["feed_time"] = stamp.strftime("%H:%M:%S")
+            direction = self.direction
 
-        previous_cum = item["last_cum_volume"]
+        # Dhan Full packets provide cumulative traded volume.
+        # Add only the positive difference to the active candle.
+        previous_volume = item["last_cum_volume"]
         delta = 0
 
-        if previous_cum is not None and cum_volume >= previous_cum:
-            delta = cum_volume - previous_cum
-        elif previous_cum is not None and cum_volume < previous_cum:
-            # Volume reset या data reset होने पर गलत बड़ा delta न जोड़ें.
-            delta = 0
+        if previous_volume is not None and cum_volume >= previous_volume:
+            delta = cum_volume - previous_volume
 
         item["last_cum_volume"] = cum_volume
-        item["last_price"] = price
 
-        # Five-minute candle boundary, IST
-        minute = (stamp.minute // 5) * 5
         candle_start = stamp.replace(
-            minute=minute, second=0, microsecond=0
+            minute=(stamp.minute // 5) * 5,
+            second=0,
+            microsecond=0,
         )
 
         candle = item["candle"]
 
         if candle is None or candle["start"] != candle_start:
             if candle is not None:
-                candle["end"] = candle["start"] + pd.Timedelta(minutes=5)
                 self.finish_candle(item, candle)
 
             candle = {
                 "start": candle_start,
-                "end": None,
                 "open": price,
                 "high": price,
                 "low": price,
@@ -201,193 +235,146 @@ class ScannerEngine:
             candle["close"] = price
             candle["volume"] += max(0, delta)
 
-        with self.lock:
-            direction = self.direction
-
-        if direction not in ("BUY", "SELL"):
-            return
-
-        if not market_is_open():
+        # Collect data from 09:15 even before BUY/SELL is selected.
+        if not market_is_open() or direction not in ("BUY", "SELL"):
             return
 
         if not item["baseline_ready"]:
             return
 
-        minimum_volume = item["baseline_min"]
-        if minimum_volume is None:
+        # Do not signal on the opening three candles.
+        if stamp.time() < dt_time(9, 30):
             return
 
-        # एक reference candle केवल तभी मान्य है जब उसकी
-        # candle पूरी हो चुकी हो और volume शुरुआती minimum से कम हो.
         completed = item["completed"]
-        if completed:
-            latest = completed[-1]
-
-            if latest["volume"] < minimum_volume:
-                is_red = latest["close"] < latest["open"]
-                is_green = latest["close"] > latest["open"]
-
-                if direction == "BUY" and is_red:
-                    item["reference"] = {
-                        "kind": "RED",
-                        "level": latest["high"],
-                        "candle": latest,
-                    }
-
-                elif direction == "SELL" and is_green:
-                    item["reference"] = {
-                        "kind": "GREEN",
-                        "level": latest["low"],
-                        "candle": latest,
-                    }
-
-        ref = item["reference"]
-        if not ref:
+        if not completed:
             return
 
-        # Signal candle must be later than the reference candle.
-        if candle["start"] <= ref["candle"]["start"]:
+        latest = completed[-1]
+        min_volume = item["baseline_min"]
+
+        # Low-volume RED candle is the BUY reference.
+        # Low-volume GREEN candle is the SELL reference.
+        if latest["volume"] < min_volume:
+            red = latest["close"] < latest["open"]
+            green = latest["close"] > latest["open"]
+
+            if direction == "BUY" and red:
+                item["reference"] = {
+                    "start": latest["start"],
+                    "high": latest["high"],
+                    "low": latest["low"],
+                    "open": latest["open"],
+                    "close": latest["close"],
+                    "volume": latest["volume"],
+                    "kind": "RED",
+                }
+
+            elif direction == "SELL" and green:
+                item["reference"] = {
+                    "start": latest["start"],
+                    "high": latest["high"],
+                    "low": latest["low"],
+                    "open": latest["open"],
+                    "close": latest["close"],
+                    "volume": latest["volume"],
+                    "kind": "GREEN",
+                }
+
+        reference = item["reference"]
+        if not reference:
             return
 
-        # Breakout is checked on each incoming tick, not at candle close.
+        # Only a candle after the reference candle can trigger.
+        if candle["start"] <= reference["start"]:
+            return
+
+        # Check breakout on every tick, without waiting for candle close.
         if (
             direction == "BUY"
-            and ref["kind"] == "RED"
-            and candle["close"] > candle["open"]
-            and price > ref["level"]
+            and reference["kind"] == "RED"
+            and price > reference["high"]
         ):
-            self.add_signal(item, "BUY", price, ref["candle"])
+            self.record_signal(item, "BUY", price, reference)
 
         elif (
             direction == "SELL"
-            and ref["kind"] == "GREEN"
-            and candle["close"] < candle["open"]
-            and price < ref["level"]
+            and reference["kind"] == "GREEN"
+            and price < reference["low"]
         ):
-            self.add_signal(item, "SELL", price, ref["candle"])
-
-    def run_feed(self):
-        token = st.secrets.get(
-            "DHAN_ACCESS_TOKEN", os.getenv("DHAN_ACCESS_TOKEN", "")
-        )
-        client_id = st.secrets.get(
-            "DHAN_CLIENT_ID", os.getenv("DHAN_CLIENT_ID", "")
-        )
-
-        if not token or not client_id:
-            with self.lock:
-                self.status = "Dhan credentials नहीं मिले"
-            return
-
-        instruments = [
-            (MarketFeed.NSE, sid, MarketFeed.Full)
-            for sid in WATCHLIST.values()
-        ]
-
-        while True:
-            try:
-                context = DhanContext(client_id, token)
-                feed = MarketFeed(context, instruments, version="v2")
-                feed.run_forever()
-
-                with self.lock:
-                    self.status = "Dhan WebSocket connected"
-
-                while True:
-                    packet = feed.get_data()
-                    if isinstance(packet, dict):
-                        self.on_tick(packet)
-
-            except Exception as exc:
-                with self.lock:
-                    self.status = (
-                        "Feed reconnect हो रहा है: "
-                        + str(exc)[:180]
-                    )
-                time.sleep(5)
+            self.record_signal(item, "SELL", price, reference)
 
 
 @st.cache_resource
-def get_engine():
-    return ScannerEngine()
+def get_scanner():
+    return Scanner()
 
 
-engine = get_engine()
+scanner = get_scanner()
+
+# IMPORTANT: Start feed on app load, not when BUY/SELL is pressed.
+scanner.start()
 
 st.title("📈 Dhan Live BUY / SELL Scanner")
-st.caption("Market time: 09:15–15:15 IST | Signal only — no orders placed")
-
-token = st.secrets.get(
-    "DHAN_ACCESS_TOKEN", os.getenv("DHAN_ACCESS_TOKEN", "")
-)
-client_id = st.secrets.get(
-    "DHAN_CLIENT_ID", os.getenv("DHAN_CLIENT_ID", "")
-)
-
-if token and client_id:
-    st.success("Dhan credentials मिले")
-else:
-    st.error(
-        "Streamlit Settings → Secrets में DHAN_ACCESS_TOKEN "
-        "और DHAN_CLIENT_ID भरें।"
-    )
+st.caption("09:15–15:15 IST | Signals only — no automatic orders")
 
 left, right = st.columns(2)
 
 with left:
     if st.button("🟢 BUY", use_container_width=True):
-        engine.choose("BUY")
+        scanner.select("BUY")
 
 with right:
     if st.button("🔴 SELL", use_container_width=True):
-        engine.choose("SELL")
+        scanner.select("SELL")
 
-with engine.lock:
-    selected = engine.direction
-    status = engine.status
-    records = list(engine.logs)
-
-if selected:
-    st.info(f"Selected direction: {selected}")
-
-st.write("**Scanner status:**", status)
-
-st.subheader("Watchlist")
-watchlist_df = pd.DataFrame([
-    {"Symbol": symbol, "Security ID": sid}
-    for symbol, sid in WATCHLIST.items()
-])
-st.dataframe(watchlist_df, use_container_width=True, hide_index=True)
-
-st.subheader("Live Prices")
-with engine.lock:
+with scanner.lock:
+    status = scanner.status
+    direction = scanner.direction
+    records = list(scanner.records)
     price_rows = [
         {
-            "Symbol": data["symbol"],
-            "LTP": data["last_price"],
-            "Baseline Min Volume": data["baseline_min"],
-            "Baseline Ready": data["baseline_ready"],
+            "Symbol": item["symbol"],
+            "LTP": item["ltp"],
+            "Last Feed Time": item["feed_time"],
+            "Opening Min Volume": item["baseline_min"],
+            "Opening 3 Candles Ready": item["baseline_ready"],
         }
-        for data in engine.symbols.values()
+        for item in scanner.items.values()
     ]
-st.dataframe(pd.DataFrame(price_rows), use_container_width=True, hide_index=True)
+
+st.write("**Scanner status:**", status)
+st.write("**Selected direction:**", direction or "Not selected")
+
+st.subheader("Live Prices and Opening Volume")
+st.dataframe(
+    pd.DataFrame(price_rows),
+    use_container_width=True,
+    hide_index=True,
+)
 
 st.subheader("Signal Records")
 records_df = pd.DataFrame(records, columns=COLUMNS)
-st.dataframe(records_df, use_container_width=True, hide_index=True)
+st.dataframe(
+    records_df,
+    use_container_width=True,
+    hide_index=True,
+)
 
-output = BytesIO()
-with pd.ExcelWriter(output, engine="openpyxl") as writer:
+excel = BytesIO()
+with pd.ExcelWriter(excel, engine="openpyxl") as writer:
     records_df.to_excel(writer, index=False, sheet_name="Signals")
-    watchlist_df.to_excel(writer, index=False, sheet_name="Watchlist")
+    pd.DataFrame(price_rows).to_excel(
+        writer, index=False, sheet_name="Live Status"
+    )
 
 st.download_button(
     "⬇️ Download Excel",
-    data=output.getvalue(),
+    data=excel.getvalue(),
     file_name=f"dhan_signals_{now_ist():%Y%m%d}.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     use_container_width=True,
 )
 
-st.caption(f"Current IST: {now_ist():%d-%m-%Y %H:%M:%S}")
-st_autorefresh(interval=5000, key="scanner_refresh")
+st.caption("Current IST: " + now_ist().strftime("%d-%m-%Y %H:%M:%S"))
+st_autorefresh(interval=5000, key="refresh_scanner")
