@@ -1,7 +1,5 @@
-
 import os
-import time
-from datetime import datetime
+from datetime import datetime, time
 from io import BytesIO
 from zoneinfo import ZoneInfo
 
@@ -40,70 +38,63 @@ COLUMNS = [
 ]
 
 st.title("📈 Dhan Live BUY / SELL Scanner")
-st.caption("Market time: 09:15 AM – 03:15 PM IST")
+st.caption("Market hours: 09:15–15:15 IST")
 
-# Dhan credentials are read from GitHub Secrets.
 client_id = os.getenv("DHAN_CLIENT_ID", "")
 access_token = os.getenv("DHAN_ACCESS_TOKEN", "")
 
 if not client_id or not access_token:
     st.error(
-        "Dhan credentials missing. Check GitHub Secrets: "
-        "DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN."
+        "Dhan Secrets missing. Set DHAN_CLIENT_ID "
+        "and DHAN_ACCESS_TOKEN in app settings."
     )
+else:
+    st.success("Dhan credentials found. Live feed connection is not yet implemented.")
 
-st.subheader("Select scan direction")
+if "direction" not in st.session_state:
+    st.session_state.direction = "BUY"
 
-left, right = st.columns(2)
+if "records" not in st.session_state:
+    st.session_state.records = []
 
-with left:
+col1, col2 = st.columns(2)
+
+with col1:
     if st.button("🟢 BUY", use_container_width=True):
-        st.session_state["direction"] = "BUY"
+        st.session_state.direction = "BUY"
 
-with right:
+with col2:
     if st.button("🔴 SELL", use_container_width=True):
-        st.session_state["direction"] = "SELL"
+        st.session_state.direction = "SELL"
 
-direction = st.session_state.get("direction", None)
-
-if direction:
-    st.info(f"Selected direction: {direction}")
+st.info(f"Selected direction: {st.session_state.direction}")
 
 st.subheader("Watchlist")
 st.write(", ".join(SYMBOLS))
 
-if "records" not in st.session_state:
-    st.session_state["records"] = []
+now = datetime.now(IST)
+market_open = time(9, 15) <= now.time() < time(15, 15)
 
-records = st.session_state["records"]
+if market_open:
+    st.success("Market scan window is open. Live scanning is not yet active.")
+else:
+    st.warning("Scan window: 09:15 AM to 03:15 PM IST.")
 
 st.subheader("Signal Records")
 
-if records:
-    df = pd.DataFrame(records, columns=COLUMNS)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+df = pd.DataFrame(st.session_state.records, columns=COLUMNS)
+st.dataframe(df, use_container_width=True, hide_index=True)
 
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Signals")
+buffer = BytesIO()
+with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+    df.to_excel(writer, index=False, sheet_name="Signals")
 
-    st.download_button(
-        "⬇️ Download Excel",
-        data=output.getvalue(),
-        file_name="dhan_signal_records.xlsx",
-        mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
-        use_container_width=True,
-    )
-else:
-    st.info("अभी कोई signal record नहीं है।")
+st.download_button(
+    "⬇️ Download Excel",
+    data=buffer.getvalue(),
+    file_name="dhan_signal_records.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    use_container_width=True,
+)
 
-now = datetime.now(IST)
-st.caption(f"Current time (IST): {now.strftime('%d-%m-%Y %H:%M:%S')}")
-
-if now.hour < 9 or (now.hour == 9 and now.minute < 15):
-    st.warning("Scanner window सुबह 09:15 बजे शुरू होगी।")
-elif now.hour > 15 or (now.hour == 15 and now.minute >= 15):
-    st.warning("Scanner window दोपहर 03:15 बजे बंद होगी।")
+st.caption(f"Current IST: {now.strftime('%d-%m-%Y %H:%M:%S')}")
