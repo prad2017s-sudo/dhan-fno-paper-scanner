@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(
     page_title="Dhan Live Scanner",
@@ -14,18 +15,18 @@ st.set_page_config(
 
 IST = ZoneInfo("Asia/Kolkata")
 
-SYMBOLS = [
-    "RELIANCE",
-    "BHARTIARTL",
-    "HDFCBANK",
-    "ICICIBANK",
-    "SBIN",
-    "TCS",
-    "BAJFINANCE",
-    "LT",
-    "LICI",
-    "HINDUNILVR",
-]
+SHARES = {
+    "RELIANCE": "2885",
+    "BHARTIARTL": "10604",
+    "HDFCBANK": "1333",
+    "ICICIBANK": "4963",
+    "SBIN": "3045",
+    "TCS": "11536",
+    "BAJFINANCE": "317",
+    "LT": "11483",
+    "LICI": "9480",
+    "HINDUNILVR": "1394",
+}
 
 COLUMNS = [
     "Date",
@@ -38,18 +39,15 @@ COLUMNS = [
 ]
 
 st.title("📈 Dhan Live BUY / SELL Scanner")
-st.caption("Market hours: 09:15–15:15 IST")
+st.caption("Market time: 09:15–15:15 IST")
 
 client_id = os.getenv("DHAN_CLIENT_ID", "")
 access_token = os.getenv("DHAN_ACCESS_TOKEN", "")
 
 if not client_id or not access_token:
-    st.error(
-        "Dhan Secrets missing. Set DHAN_CLIENT_ID "
-        "and DHAN_ACCESS_TOKEN in app settings."
-    )
+    st.error("DHAN_CLIENT_ID या DHAN_ACCESS_TOKEN Secret नहीं मिला।")
 else:
-    st.success("Dhan credentials found. Live feed connection is not yet implemented.")
+    st.success("Dhan credentials मिले।")
 
 if "direction" not in st.session_state:
     st.session_state.direction = "BUY"
@@ -57,28 +55,45 @@ if "direction" not in st.session_state:
 if "records" not in st.session_state:
     st.session_state.records = []
 
-col1, col2 = st.columns(2)
+if "scanner_enabled" not in st.session_state:
+    st.session_state.scanner_enabled = False
 
-with col1:
+buy_col, sell_col = st.columns(2)
+
+with buy_col:
     if st.button("🟢 BUY", use_container_width=True):
         st.session_state.direction = "BUY"
+        st.session_state.scanner_enabled = True
 
-with col2:
+with sell_col:
     if st.button("🔴 SELL", use_container_width=True):
         st.session_state.direction = "SELL"
+        st.session_state.scanner_enabled = True
 
 st.info(f"Selected direction: {st.session_state.direction}")
 
 st.subheader("Watchlist")
-st.write(", ".join(SYMBOLS))
+st.dataframe(
+    pd.DataFrame(
+        [{"Symbol": name, "Security ID": sid}
+         for name, sid in SHARES.items()]
+    ),
+    use_container_width=True,
+    hide_index=True,
+)
 
 now = datetime.now(IST)
 market_open = time(9, 15) <= now.time() < time(15, 15)
 
-if market_open:
-    st.success("Market scan window is open. Live scanning is not yet active.")
+if not market_open:
+    st.warning("स्कैनिंग का समय सुबह 09:15 से दोपहर 03:15 IST है।")
+elif st.session_state.scanner_enabled:
+    st.warning(
+        "चयन सेव है। लाइव WebSocket और breakout logic अभी जोड़ना बाकी है; "
+        "अभी कोई वास्तविक सिग्नल नहीं बन रहा।"
+    )
 else:
-    st.warning("Scan window: 09:15 AM to 03:15 PM IST.")
+    st.info("स्कैन शुरू करने के लिए BUY या SELL चुनें।")
 
 st.subheader("Signal Records")
 
@@ -93,8 +108,15 @@ st.download_button(
     "⬇️ Download Excel",
     data=buffer.getvalue(),
     file_name="dhan_signal_records.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    mime=(
+        "application/vnd.openxmlformats-officedocument."
+        "spreadsheetml.sheet"
+    ),
     use_container_width=True,
 )
 
 st.caption(f"Current IST: {now.strftime('%d-%m-%Y %H:%M:%S')}")
+
+# Refreshing the page alone does not connect a market feed.
+if st.session_state.scanner_enabled and market_open:
+    st_autorefresh(interval=5000, key="ui_refresh")
