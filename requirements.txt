@@ -1,7 +1,7 @@
-
 streamlit
 pandas
 requests
 websocket-client
 openpyxl
 python-dotenv
+dhanhq
