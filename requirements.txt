@@ -3,3 +3,4 @@ pandas
 openpyxl
 dhanhq==2.3.0
 streamlit-autorefresh
+requests
