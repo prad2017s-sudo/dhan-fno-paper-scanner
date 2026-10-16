@@ -184,7 +184,12 @@ if not chart.empty:
     sym=st.selectbox("Chart symbol",opts); view=chart if sym=="All" else chart[chart["Symbol"]==sym]
     st.dataframe(view,use_container_width=True,hide_index=True)
     buf=BytesIO()
-    with pd.ExcelWriter(buf,engine="openpyxl") as w:view.to_excel(w,index=False,sheet_name="5-Min Chart")
+    export_view=view.copy()
+    # Excel does not support timezone-aware datetimes; preserve IST as readable text.
+    if "DateTime" in export_view.columns:
+        export_view["DateTime"] = export_view["DateTime"].astype(str)
+    with pd.ExcelWriter(buf,engine="openpyxl") as w:
+        export_view.to_excel(w,index=False,sheet_name="5-Min Chart")
     st.download_button("â¬‡ï¸ Download Chart Excel",buf.getvalue(),f"dhan_5min_chart_{now_ist():%Y%m%d}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
 else:st.caption("à¤ªà¥‚à¤°à¥‡ à¤¦à¤¿à¤¨ à¤•à¤¾ chart à¤¦à¥‡à¤–à¤¨à¥‡ à¤•à¥‡ à¤²à¤¿à¤ à¤Šà¤ªà¤° button à¤¦à¤¬à¤¾à¤à¤.")
 st.subheader("Signal Records")
