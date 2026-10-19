@@ -169,9 +169,16 @@ signal_cols = ["symbol","range_from","range_to","range_high","range_high_time","
 trade_cols = ["symbol","entry_time","entry_price","quantity","current_price","pnl_rupees","pnl_percent","status"]
 
 def read_csv(path, cols):
+    """Load existing CSV while tolerating older schemas from previous app versions."""
     if path.exists():
         try:
-            return pd.read_csv(path)
+            df = pd.read_csv(path)
+            # Older CSVs may not have columns introduced by a newer app version.
+            for col in cols:
+                if col not in df.columns:
+                    df[col] = pd.NA
+            # Keep expected columns first; preserve extra historical columns afterward.
+            return df[cols + [c for c in df.columns if c not in cols]]
         except Exception:
             pass
     return pd.DataFrame(columns=cols)
@@ -217,6 +224,10 @@ st.subheader("🔔 Breakout / Red Candle Signals")
 if signals.empty:
     st.info("Date range choose karke Scan dabayein.")
 else:
+    # Defensive schema repair: supports signals.csv saved by older app versions.
+    for c in signal_cols:
+        if c not in signals.columns:
+            signals[c] = pd.NA
     for c in ["range_high","red_high","entry_price","current_price"]:
         signals[c] = pd.to_numeric(signals[c], errors="coerce").round(2)
     st.dataframe(signals, use_container_width=True, hide_index=True)
@@ -225,6 +236,9 @@ st.subheader("📒 Paper Trading — Trade Sheet")
 if trades.empty:
     st.info("Abhi koi paper entry trigger nahi hui.")
 else:
+    for c in trade_cols:
+        if c not in trades.columns:
+            trades[c] = pd.NA
     for c in ["entry_price","current_price","quantity"]:
         trades[c] = pd.to_numeric(trades[c], errors="coerce")
     trades["pnl_rupees"] = ((trades["current_price"] - trades["entry_price"]) * trades["quantity"]).round(2)
