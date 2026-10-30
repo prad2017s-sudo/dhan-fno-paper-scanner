@@ -10,7 +10,7 @@ import yfinance as yf
 IST = ZoneInfo("Asia/Kolkata")
 
 st.set_page_config(
-    page_title="NSE 1-Hour Monthly High Breakout Screener",
+    page_title="NSE Monthly Low + Weekly High + 1-Hour Screener",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -29,19 +29,22 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("NSE 1-Hour Monthly High Breakout Screener")
-st.caption("NSE cash market | 1-hour candles | Monthly high breakout | Red-candle confirmation")
+st.title("NSE Monthly Low + Weekly High + 1-Hour Screener")
+st.caption("NSE cash market | Previous-month low test | Completed weekly high | 1-hour confirmation")
 
 st.info(
     """
     **Scanner rules**
-    1. The first green 1-hour candle of the current month must close above the previous completed month's High, with the previous candle closing at or below that High.
-    2. After the breakout candle, exactly 1, 2, or 3 additional green 1-hour candles must form.
-    3. The next candle must be red and its Close must remain above the previous month's High.
-    4. The immediately following candle must break the red candle's High (its High must be greater than the red candle's High).
-    5. Only one signal per symbol per month. The currently forming 1-hour candle is ignored.
+    1. Take the LOW of the previous fully completed calendar month (not the current month's low).
+    2. Consider only fully completed weekly candles belonging to the current month. A weekly candle qualifies when its Low is at or below 1% above the previous month's Low. This includes a move below or a touch of that monthly Low.
+    3. Mark the qualifying weekly candle's High. The most recent qualifying completed weekly candle is used.
+    4. On the 1-hour chart, a green candle must close above that weekly High from below.
+    5. Then 1-3 additional green hourly candles, followed by a red candle closing above the weekly High.
+    6. The next hourly candle must break the red candle's High.
+    7. Assumed entry is the red candle's High; SL is 3% and target is 6%.
+    8. Only completed hourly and weekly candles are used. One signal per symbol per month.
 
-    **Important:** Yahoo Finance generally provides only a limited recent history for 1-hour data. The scanner needs enough hourly data to include the previous month's High.
+    **Data note:** Yahoo Finance may delay or omit data. The scan is a screening/backtest estimate, not a live execution guarantee.
     """
 )
 
@@ -145,6 +148,93 @@ def download_hourly(symbol):
         return pd.DataFrame()
 
 
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def download_daily(symbol):
+    try:
+        data = yf.Ticker(f"{symbol}.NS").history(
+            period="2y", interval="1d", auto_adjust=False, actions=False, prepost=False
+        )
+        if data is None or data.empty:
+            return pd.DataFrame()
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = [col[0] for col in data.columns]
+        required = ["Low"]
+        if any(column not in data.columns for column in required):
+            return pd.DataFrame()
+        data[required] = data[required].apply(pd.to_numeric, errors="coerce")
+        data = data.dropna(subset=required).sort_index()
+        return data[~data.index.duplicated(keep="last")]
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def download_weekly(symbol):
+    try:
+        data = yf.Ticker(f"{symbol}.NS").history(
+            period="2y", interval="1wk", auto_adjust=False, actions=False, prepost=False
+        )
+        if data is None or data.empty:
+            return pd.DataFrame()
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = [col[0] for col in data.columns]
+        required = ["High", "Low", "Close"]
+        if any(column not in data.columns for column in required):
+            return pd.DataFrame()
+        data[required] = data[required].apply(pd.to_numeric, errors="coerce")
+        data = data.dropna(subset=required).sort_index()
+        return data[~data.index.duplicated(keep="last")]
+    except Exception:
+        return pd.DataFrame()
+
+
+def localize_market_index(data):
+    idx = pd.DatetimeIndex(pd.to_datetime(data.index))
+    if idx.tz is None:
+        idx = idx.tz_localize("Asia/Kolkata")
+    else:
+        idx = idx.tz_convert("Asia/Kolkata")
+    return idx
+
+
+def get_previous_month_low_and_weekly_high(symbol, now):
+    daily = download_daily(symbol)
+    weekly = download_weekly(symbol)
+    if daily.empty or weekly.empty:
+        return None
+
+    daily_idx = localize_market_index(daily)
+    month_start = pd.Timestamp(now.year, now.month, 1, tz="Asia/Kolkata")
+    prev_month_end = month_start - pd.Timedelta(nanoseconds=1)
+    prev_month_start = pd.Timestamp(
+        prev_month_end.year, prev_month_end.month, 1, tz="Asia/Kolkata"
+    )
+    prev_mask = (daily_idx >= prev_month_start) & (daily_idx <= prev_month_end)
+    prev_month = daily.loc[prev_mask]
+    if prev_month.empty:
+        return None
+    previous_month_low = float(prev_month["Low"].min())
+
+    weekly_idx = localize_market_index(weekly)
+    # Yahoo weekly bars are normally stamped at the start of the week (Monday).
+    # A weekly candle is complete after Friday's NSE close (15:30 IST).
+    weekly_end = weekly_idx.normalize() + pd.Timedelta(days=4, hours=15, minutes=30)
+    completed_mask = (weekly_idx >= month_start) & (weekly_end <= pd.Timestamp(now))
+    completed_weekly = weekly.loc[completed_mask].copy()
+    if completed_weekly.empty:
+        return None
+
+    qualifying = completed_weekly[
+        completed_weekly["Low"].astype(float) <= previous_month_low * 1.01
+    ]
+    if qualifying.empty:
+        return None
+
+    chosen = qualifying.iloc[-1]
+    chosen_date = qualifying.index[-1]
+    return previous_month_low, float(chosen["High"]), str(chosen_date)
+
 def remove_incomplete_hourly_candle(data, now):
     """Keep completed hourly bars; discard only the currently forming bar."""
     if data.empty:
@@ -164,44 +254,29 @@ def remove_incomplete_hourly_candle(data, now):
     return result
 
 
-def scan_symbol(symbol, minimum_price, maximum_price):
+def scan_symbol(symbol, investment_per_stock):
+    now = datetime.now(IST)
+    levels = get_previous_month_low_and_weekly_high(symbol, now)
+    if levels is None:
+        return None
+    previous_month_low, weekly_high, weekly_candle_date = levels
+
     data = download_hourly(symbol)
     if data.empty or len(data) < 10:
         return None
-
-    now = datetime.now(IST)
     data = remove_incomplete_hourly_candle(data, now)
     if len(data) < 10:
         return None
 
     latest_price = float(data["Close"].iloc[-1])
-    if not minimum_price <= latest_price <= maximum_price:
-        return None
 
     dates = pd.DatetimeIndex(data.index)
     month_start = pd.Timestamp(now.year, now.month, 1, tz="Asia/Kolkata")
-    previous_month_end = month_start - pd.Timedelta(nanoseconds=1)
-    previous_month_start = pd.Timestamp(
-        previous_month_end.year, previous_month_end.month, 1, tz="Asia/Kolkata"
-    )
-
-    previous_month_mask = (
-        (dates >= previous_month_start) & (dates <= previous_month_end)
-    )
-    previous_month = data.loc[previous_month_mask]
-    if previous_month.empty:
-        return None
-
-    previous_month_high = float(previous_month["High"].max())
-
-    current_month_positions = [
-        i for i, date in enumerate(dates)
-        if date >= month_start
-    ]
+    current_month_positions = [i for i, date in enumerate(dates) if date >= month_start]
     if len(current_month_positions) < 4:
         return None
 
-    # Find only the first green hourly breakout candle of this month.
+    # First green hourly close above the selected completed weekly candle's High.
     breakout_i = None
     for i in current_month_positions:
         if i == 0:
@@ -210,72 +285,61 @@ def scan_symbol(symbol, minimum_price, maximum_price):
         previous = data.iloc[i - 1]
         if (
             float(candle["Close"]) > float(candle["Open"])
-            and float(candle["Close"]) > previous_month_high
-            and float(previous["Close"]) <= previous_month_high
+            and float(candle["Close"]) > weekly_high
+            and float(previous["Close"]) <= weekly_high
         ):
             breakout_i = i
             break
-
     if breakout_i is None:
         return None
 
     green_count = 0
     red_i = None
-
-    # After breakout: 1-3 extra green candles, then a red candle.
     for j in range(breakout_i + 1, len(data)):
         candle = data.iloc[j]
         open_price = float(candle["Open"])
         close_price = float(candle["Close"])
-
         if close_price > open_price:
             green_count += 1
             if green_count > 3:
                 return None
             continue
-
         if close_price < open_price:
-            if 1 <= green_count <= 3 and close_price > previous_month_high:
+            if 1 <= green_count <= 3 and close_price > weekly_high:
                 red_i = j
             break
-
-        # A doji interrupts the pattern.
         break
-
     if red_i is None:
         return None
 
-    # The candle immediately after the red candle must break its High.
     trigger_i = red_i + 1
     if trigger_i >= len(data):
         return None
-
     red_candle = data.iloc[red_i]
     trigger_candle = data.iloc[trigger_i]
     red_high = float(red_candle["High"])
     trigger_high = float(trigger_candle["High"])
-
     if trigger_high <= red_high:
         return None
 
-    # Assumed entry is the red candle's High, once the next candle breaks it.
-    # SL is 3% below entry and target is 10% above entry.
+    # Entry assumed at the red candle's High after the following candle breaks it.
     entry_price = red_high
+    if entry_price > investment_per_stock:
+        return None  # At least one whole share must fit within the per-stock budget.
+    quantity = int(investment_per_stock // entry_price)
+    actual_investment = quantity * entry_price
     stop_loss = entry_price * 0.97
-    target_price = entry_price * 1.10
+    target_price = entry_price * 1.06
+    estimated_sl_loss = quantity * (entry_price - stop_loss)
+    estimated_target_profit = quantity * (target_price - entry_price)
 
-    # Check only candles AFTER the breakout-trigger candle.
     outcome = "Pending"
     outcome_date = ""
     outcome_price = float("nan")
-
     for k in range(trigger_i + 1, len(data)):
         later = data.iloc[k]
         hit_sl = float(later["Low"]) <= stop_loss
         hit_target = float(later["High"]) >= target_price
-
-        # If both levels occur in one hourly candle, count SL first:
-        # OHLC data cannot show which level was touched first.
         if hit_sl and hit_target:
             outcome = "SL hit (both levels same candle; counted as SL)"
             outcome_date = str(dates[k])
@@ -287,40 +351,38 @@ def scan_symbol(symbol, minimum_price, maximum_price):
             outcome_price = stop_loss
             break
         if hit_target:
-            outcome = "10% Target hit"
+            outcome = "6% Target hit"
             outcome_date = str(dates[k])
             outcome_price = target_price
             break
 
     one_year_low = float(data["Low"].tail(252 * 6).min())
-    percent_above_low = (
-        ((latest_price / one_year_low) - 1.0) * 100.0
-        if one_year_low > 0 else float("nan")
-    )
-
+    percent_above_low = ((latest_price / one_year_low) - 1.0) * 100.0 if one_year_low > 0 else float("nan")
     close_series = data["Close"].astype(float)
     ma20 = float(close_series.tail(20).mean()) if len(close_series) >= 20 else float("nan")
     ma50 = float(close_series.tail(50).mean()) if len(close_series) >= 50 else float("nan")
-    rising_trend = (
-        bool(latest_price > ma20 and ma20 > ma50)
-        if pd.notna(ma20) and pd.notna(ma50) else False
-    )
+    rising_trend = bool(latest_price > ma20 and ma20 > ma50) if pd.notna(ma20) and pd.notna(ma50) else False
 
     return {
         "Symbol": symbol,
         "Rising Trend": "Yes" if rising_trend else "No",
         "Latest 1H Close (INR)": round(latest_price, 2),
-        "Previous Month High (INR)": round(previous_month_high, 2),
-        "Breakout Date-Time": str(dates[breakout_i]),
-        "Extra Green Candles": green_count,
+        "Previous Month Low (INR)": round(previous_month_low, 2),
+        "Qualifying Weekly Candle Date": weekly_candle_date,
+        "Weekly Candle High (INR)": round(weekly_high, 2),
+        "1H Breakout Date-Time": str(dates[breakout_i]),
+        "Extra Green 1H Candles": green_count,
         "Red Candle Date-Time": str(dates[red_i]),
         "Red Candle Close (INR)": round(float(red_candle["Close"]), 2),
         "Red Candle High (INR)": round(red_high, 2),
         "High-Break Candle Date-Time": str(dates[trigger_i]),
-        "High-Break Candle High (INR)": round(trigger_high, 2),
         "Assumed Entry (INR)": round(entry_price, 2),
+        "Shares with Budget": quantity,
+        "Actual Investment (INR)": round(actual_investment, 2),
         "Stop-Loss -3% (INR)": round(stop_loss, 2),
-        "Target +10% (INR)": round(target_price, 2),
+        "Estimated SL Loss (INR)": round(estimated_sl_loss, 2),
+        "Target +6% (INR)": round(target_price, 2),
+        "Estimated Target Profit (INR)": round(estimated_target_profit, 2),
         "Trade Result": outcome,
         "Result Date-Time": outcome_date,
         "Exit Level (INR)": round(outcome_price, 2) if pd.notna(outcome_price) else "",
@@ -331,28 +393,21 @@ def scan_symbol(symbol, minimum_price, maximum_price):
 
 with st.sidebar:
     st.header("Scan Settings")
-    min_price = st.number_input(
-        "Minimum Price (INR)", min_value=0.0, value=100.0, step=10.0
-    )
-    max_price = st.number_input(
-        "Maximum Price (INR)", min_value=1.0, value=5000.0, step=100.0
+    investment_per_stock = st.number_input(
+        "Investment per stock (INR)", min_value=500.0, value=5000.0, step=500.0
     )
     scan_size = st.selectbox(
         "Stocks to Scan",
         ["All eligible cash stocks", "First 100 (test)", "First 250"],
     )
     st.caption(
-        "1-hour historical data is limited by the data provider. Full scan may take several minutes."
+        "Whole-share quantity is calculated from the per-stock budget. Stocks priced above the budget are skipped."
     )
-
-if min_price > max_price:
-    st.error("Minimum price must not exceed maximum price.")
-    st.stop()
 
 metric1, metric2, metric3 = st.columns(3)
 metric1.metric("Timeframe", "1 Hour")
-metric2.metric("Price Range", f"INR {min_price:g} - {max_price:g}")
-metric3.metric("Market", "NSE Cash (F&O excluded)")
+metric2.metric("Budget / Stock", f"₹{investment_per_stock:,.0f}")
+metric3.metric("SL / Target", "3% / 6%")
 
 if st.button("Scan Stocks Now", type="primary", use_container_width=True):
     try:
@@ -373,7 +428,7 @@ if st.button("Scan Stocks Now", type="primary", use_container_width=True):
         for number, symbol in enumerate(symbols, start=1):
             status.write(f"Checking **{symbol}** ({number}/{len(symbols)})")
             try:
-                match = scan_symbol(symbol, min_price, max_price)
+                match = scan_symbol(symbol, investment_per_stock)
                 if match:
                     results.append(match)
             except Exception:
@@ -397,7 +452,7 @@ if st.button("Scan Stocks Now", type="primary", use_container_width=True):
             st.download_button(
                 "Download Results CSV",
                 data=result_df.to_csv(index=False).encode("utf-8-sig"),
-                file_name="nse_1hour_monthly_high_breakout.csv",
+                file_name="nse_monthly_low_weekly_high_1hour.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
@@ -409,7 +464,7 @@ if st.button("Scan Stocks Now", type="primary", use_container_width=True):
             st.download_button(
                 "Download Results Excel",
                 data=excel_buffer.getvalue(),
-                file_name="nse_1hour_monthly_high_breakout.xlsx",
+                file_name="nse_monthly_low_weekly_high_1hour.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
@@ -424,23 +479,23 @@ if st.button("Scan Stocks Now", type="primary", use_container_width=True):
     except Exception as error:
         st.error(f"Scan failed: {error}")
 else:
-    st.write("Set the price range in the sidebar and press Scan Stocks Now.")
+    st.write("Set the investment per stock in the sidebar and press Scan Stocks Now.")
     st.caption("Results will appear here after scanning.")
 
 with st.expander("Scanner Rules"):
     st.markdown(
         """
-        1. NSE EQ cash-market symbols are scanned and symbols in the NSE F&O list are excluded.
-        2. The first green 1-hour candle of the current month must close above the previous completed month's High from below.
-        3. Exactly 1, 2, or 3 additional green 1-hour candles must follow.
-        4. The next candle must be red and close above the previous month's High.
-        5. The immediately following candle must have a High greater than the red candle's High.
-        6. Assumed entry is the red candle's High; stop-loss is 3% below entry and target is 10% above entry.
-        7. Subsequent completed hourly candles are checked to see whether SL or target was reached first.
-        8. If both levels occur in one hourly candle, the result is conservatively counted as SL.
-        9. If neither level is reached in available data, the result is Pending.
-        10. Only one signal per symbol per month.
-        11. The currently forming 1-hour candle is ignored.
+        1. Use the previous fully completed calendar month's Low; do not use the current month's Low.
+        2. Use only fully completed weekly candles that start in the current month.
+        3. A weekly candle qualifies when its Low is at or below 1% above the previous month's Low.
+        4. The most recent qualifying weekly candle's High becomes the 1-hour breakout level.
+        5. A green 1-hour candle must close above that weekly High from below.
+        6. Then 1-3 additional green hourly candles, followed by a red candle closing above the weekly High.
+        7. The next hourly candle must break the red candle's High.
+        8. Assumed entry is the red candle's High; SL is 3% below entry and target is 6% above entry.
+        9. Later completed hourly candles are checked; if SL and target occur in the same candle, count SL first.
+        10. If neither level is reached in available data, the result is Pending.
+        11. Only one signal per symbol per month. Incomplete weekly and hourly candles are ignored.
         """
     )
 
