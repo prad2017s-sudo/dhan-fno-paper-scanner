@@ -259,10 +259,10 @@ def scan_symbol(symbol, minimum_price, maximum_price):
         return None
 
     # Assumed entry is the red candle's High, once the next candle breaks it.
-    # SL is 3% below entry and target is 6% above entry.
+    # SL is 3% below entry and target is 10% above entry.
     entry_price = red_high
     stop_loss = entry_price * 0.97
-    target_price = entry_price * 1.06
+    target_price = entry_price * 1.10
 
     # Check only candles AFTER the breakout-trigger candle.
     outcome = "Pending"
@@ -287,7 +287,7 @@ def scan_symbol(symbol, minimum_price, maximum_price):
             outcome_price = stop_loss
             break
         if hit_target:
-            outcome = "6% Target hit"
+            outcome = "10% Target hit"
             outcome_date = str(dates[k])
             outcome_price = target_price
             break
@@ -320,7 +320,7 @@ def scan_symbol(symbol, minimum_price, maximum_price):
         "High-Break Candle High (INR)": round(trigger_high, 2),
         "Assumed Entry (INR)": round(entry_price, 2),
         "Stop-Loss -3% (INR)": round(stop_loss, 2),
-        "Target +6% (INR)": round(target_price, 2),
+        "Target +10% (INR)": round(target_price, 2),
         "Trade Result": outcome,
         "Result Date-Time": outcome_date,
         "Exit Level (INR)": round(outcome_price, 2) if pd.notna(outcome_price) else "",
@@ -435,7 +435,7 @@ with st.expander("Scanner Rules"):
         3. Exactly 1, 2, or 3 additional green 1-hour candles must follow.
         4. The next candle must be red and close above the previous month's High.
         5. The immediately following candle must have a High greater than the red candle's High.
-        6. Assumed entry is the red candle's High; stop-loss is 3% below entry and target is 6% above entry.
+        6. Assumed entry is the red candle's High; stop-loss is 3% below entry and target is 10% above entry.
         7. Subsequent completed hourly candles are checked to see whether SL or target was reached first.
         8. If both levels occur in one hourly candle, the result is conservatively counted as SL.
         9. If neither level is reached in available data, the result is Pending.
