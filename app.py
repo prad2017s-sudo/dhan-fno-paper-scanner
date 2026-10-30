@@ -1,252 +1,390 @@
+import io
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
-from pathlib import Path
-from datetime import datetime, date, timedelta
 
-st.set_page_config(page_title="Nifty 100 Date-Range Breakout Paper Trader", page_icon="📈", layout="wide")
-ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "data"
-DATA_DIR.mkdir(exist_ok=True)
-TRADES_PATH = DATA_DIR / "paper_trades.csv"
-SIGNALS_PATH = DATA_DIR / "signals.csv"
+IST = ZoneInfo("Asia/Kolkata")
 
-st.title("📈 Nifty 100 — Date-Range High Breakout Paper Trading")
-st.caption("Paper trading only • No real orders • Data availability depends on provider")
+st.set_page_config(
+    page_title="NSE Daily Breakout Screener",
+    page_icon="ðŸ“ˆ",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-with st.sidebar:
-    st.header("Settings")
-    capital = st.number_input("Virtual capital per trade (₹)", min_value=1000, value=100000, step=10000)
-    green_limit = st.selectbox("Green candles after breakout", [1, 2, 3], index=2)
-    st.subheader("High calculation date range")
-    default_end = date.today() - timedelta(days=3)
-    default_start = default_end - timedelta(days=4)
-    start_date = st.date_input("High range — from", value=default_start)
-    end_date = st.date_input("High range — to", value=default_end)
-    st.caption("The range's High becomes the breakout level. Scanning starts only after the ending date.")
-    st.warning("Yahoo Finance data may be delayed/incomplete. Use a licensed broker feed for reliable live data.")
+# Streamlit already supports UTF-8. This CSS improves mobile readability.
+st.markdown(
+    """
+    <style>
+    .block-container {padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1200px;}
+    h1 {font-size: clamp(1.45rem, 4vw, 2.15rem) !important; line-height: 1.35 !important;}
+    .stButton button, .stDownloadButton button {width: 100%; min-height: 2.8rem; font-weight: 600;}
+    div[data-testid="stMetricValue"] {font-size: clamp(1rem, 3.3vw, 1.7rem);}
+    div[data-testid="stAlert"] {line-height: 1.6;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-if start_date > end_date:
-    st.error("Starting date ending date se pehle honi chahiye.")
-    st.stop()
-if end_date >= date.today():
-    st.warning("Ending date aaj ya future mein hai. Breakout scan ending date ke baad ke available completed hourly candles par hi chalega.")
+st.title("NSE Daily Breakout Screener")
+st.caption("NSE cash market | Daily candles | First monthly breakout | Red-candle confirmation")
+
+st.info(
+    """
+    **Rules:** The first green daily candle of the current month must close above the previous completed month's High from below.
+    After it, exactly 1, 2, or 3 additional green daily candles must form, followed immediately by a red candle.
+    The red candle's High must be below the immediately preceding green candle's High.
+    Only one signal per symbol per month. Today's incomplete candle is ignored.
+    """
+)
+
+EQUITY_URLS = [
+    "https://archives.nseindia.com/content/equities/EQUITY_L.csv",
+    "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv",
+]
+FO_URLS = [
+    "https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv",
+    "https://archives.nseindia.com/content/fo/fo_mktlots.csv",
+]
+HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "text/csv,*/*"}
+
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_nifty100_symbols():
-    try:
-        tables = pd.read_html("https://en.wikipedia.org/wiki/NIFTY_100")
-        for table in tables:
-            symbol_col = next((c for c in table.columns if str(c).strip().lower() in ("symbol", "company symbol")), None)
-            if symbol_col is not None:
-                symbols = table[symbol_col].astype(str).str.strip()
-                symbols = [s.replace(".", "-") + ".NS" for s in symbols if s and s.lower() not in ("nan", "symbol")]
-                symbols = sorted(set(symbols))
-                if len(symbols) >= 80:
-                    return symbols, "Public constituent table"
-    except Exception:
-        pass
-    return [
-        "RELIANCE.NS","HDFCBANK.NS","ICICIBANK.NS","INFY.NS","TCS.NS","ITC.NS",
-        "LT.NS","SBIN.NS","BHARTIARTL.NS","AXISBANK.NS","KOTAKBANK.NS","HINDUNILVR.NS",
-        "BAJFINANCE.NS","MARUTI.NS","SUNPHARMA.NS","TATAMOTORS.NS","TATASTEEL.NS",
-        "NTPC.NS","POWERGRID.NS","M&M.NS","ULTRACEMCO.NS","ASIANPAINT.NS","WIPRO.NS",
-        "ONGC.NS","ADANIPORTS.NS","COALINDIA.NS","JSWSTEEL.NS","TECHM.NS","HCLTECH.NS",
-        "GRASIM.NS","INDUSINDBK.NS","NESTLEIND.NS","TITAN.NS","DRREDDY.NS","CIPLA.NS",
-        "APOLLOHOSP.NS","EICHERMOT.NS","HEROMOTOCO.NS","DIVISLAB.NS","BRITANNIA.NS",
-        "BPCL.NS","IOC.NS","TATACONSUM.NS","SBILIFE.NS","HDFCLIFE.NS","BAJAJFINSV.NS",
-        "SHRIRAMFIN.NS","BEL.NS","TRENT.NS","PIDILITIND.NS"
-    ], "Fallback list (partial)"
+def get_symbols():
+    equity = None
+    for url in EQUITY_URLS:
+        try:
+            response = requests.get(url, headers=HEADERS, timeout=25)
+            response.raise_for_status()
+            equity = pd.read_csv(io.StringIO(response.content.decode("utf-8-sig", errors="replace")))
+            if not equity.empty:
+                break
+        except Exception:
+            continue
 
-def download_hourly(symbol):
+    if equity is None or equity.empty:
+        raise RuntimeError(
+            "NSE equity list download failed."
+        )
+
+    equity.columns = [str(c).strip().upper() for c in equity.columns]
+    if "SYMBOL" not in equity.columns:
+        raise RuntimeError("NSE list is missing the SYMBOL column.")
+    if "SERIES" in equity.columns:
+        equity = equity[equity["SERIES"].astype(str).str.strip().str.upper().eq("EQ")]
+    cash_symbols = set(equity["SYMBOL"].dropna().astype(str).str.strip().str.upper())
+
+    fo = None
+    for url in FO_URLS:
+        try:
+            response = requests.get(url, headers=HEADERS, timeout=25)
+            response.raise_for_status()
+            fo = pd.read_csv(io.StringIO(response.content.decode("utf-8-sig", errors="replace")))
+            if not fo.empty:
+                break
+        except Exception:
+            continue
+
+    if fo is None or fo.empty:
+        raise RuntimeError(
+            "F&O list download failed; scan stopped to avoid including F&O stocks."
+        )
+
+    fo.columns = [str(c).strip().upper() for c in fo.columns]
+    fo_symbols = set()
+    for column in ("SYMBOL", "UNDERLYING", "UNDERLYING_SYMBOL"):
+        if column in fo.columns:
+            fo_symbols.update(fo[column].dropna().astype(str).str.strip().str.upper())
+    if not fo_symbols:
+        raise RuntimeError("Could not identify the symbol column in the F&O list.")
+
+    return sorted(cash_symbols - fo_symbols)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def download_daily(symbol):
     try:
-        df = yf.download(symbol, period="60d", interval="1h", auto_adjust=False, progress=False, threads=False)
-        if df is None or df.empty:
+        data = yf.Ticker(f"{symbol}.NS").history(
+            period="1y", interval="1d", auto_adjust=False, actions=False
+        )
+        if data is None or data.empty:
             return pd.DataFrame()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df.columns = [str(c).title() for c in df.columns]
-        cols = ["Open", "High", "Low", "Close", "Volume"]
-        if not all(c in df.columns for c in cols):
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = [col[0] for col in data.columns]
+        required = ["Open", "High", "Low", "Close"]
+        if any(column not in data.columns for column in required):
             return pd.DataFrame()
-        df = df[cols].dropna().copy()
-        df.index = pd.to_datetime(df.index)
-        now = pd.Timestamp.now(tz=df.index.tz) if df.index.tz is not None else pd.Timestamp.now()
-        # Hourly bar start time; only completed bars.
-        df = df[df.index + pd.Timedelta(hours=1) <= now]
-        return df
+        data[required] = data[required].apply(pd.to_numeric, errors="coerce")
+        data = data.dropna(subset=required).sort_index()
+        return data[~data.index.duplicated(keep="last")]
     except Exception:
         return pd.DataFrame()
 
-def analyze_symbol(symbol, start_date, end_date, green_limit):
-    df = download_hourly(symbol)
-    if len(df) < 8:
-        return None, "Insufficient hourly data"
-    # Compare by local date labels from provider (usually Asia/Kolkata for NSE).
-    bar_dates = pd.Series([x.date() for x in df.index], index=df.index)
-    ref_mask = (bar_dates >= start_date) & (bar_dates <= end_date) & (pd.Series(df.index.dayofweek, index=df.index) < 5)
-    ref_df = df.loc[ref_mask.values]
-    if ref_df.empty:
-        return None, "No reference candles in selected date range"
-    range_high = float(ref_df["High"].max())
-    range_high_time = str(ref_df["High"].idxmax())
 
-    # Strictly after ending date: selected dates are used only to calculate reference high.
-    scan_df = df.loc[(bar_dates > end_date).values & (pd.Series(df.index.dayofweek, index=df.index) < 5).values]
-    if len(scan_df) < 2:
-        return {
-            "symbol": symbol, "range_from": str(start_date), "range_to": str(end_date),
-            "range_high": range_high, "range_high_time": range_high_time,
-            "breakout_time": "", "green_count": None, "red_time": "", "red_high": None,
-            "status": "Waiting for post-range candles", "entry_price": None, "entry_time": "",
-            "current_price": float(df["Close"].iloc[-1])
-        }, None
+def scan_symbol(symbol, minimum_price, maximum_price):
+    data = download_daily(symbol)
+    if data.empty or len(data) < 5:
+        return None
 
-    # Search post-range candles. For each green candle closing above fixed range high,
-    # count consecutive green candles (the first candle is breakout candle).
-    found = None
-    values = scan_df
-    for i in range(len(values)):
-        candle = values.iloc[i]
-        if float(candle["Close"]) <= float(range_high) or float(candle["Close"]) <= float(candle["Open"]):
+    # Ignore today's possibly unfinished daily candle.
+    now = pd.Timestamp.now(tz=IST)
+    parsed_dates = pd.to_datetime(data.index)
+    if getattr(data.index, "tz", None) is not None:
+        today_mask = parsed_dates.tz_convert("Asia/Kolkata").date == now.date()
+    else:
+        today_mask = parsed_dates.date == now.date()
+    if len(data) and bool(today_mask[-1]):
+        data = data.iloc[:-1]
+    if len(data) < 5:
+        return None
+
+    latest_price = float(data["Close"].iloc[-1])
+    if not minimum_price <= latest_price <= maximum_price:
+        return None
+
+    dates = pd.DatetimeIndex(pd.to_datetime(data.index))
+    if dates.tz is not None:
+        dates = dates.tz_localize(None)
+
+    month_start = pd.Timestamp(now.year, now.month, 1)
+    previous_month_end = month_start - pd.Timedelta(days=1)
+    previous_month_start = pd.Timestamp(previous_month_end.year, previous_month_end.month, 1)
+
+    previous_month_mask = (dates >= previous_month_start) & (dates <= previous_month_end)
+    previous_month = data.loc[previous_month_mask]
+    if previous_month.empty:
+        return None
+    previous_month_high = float(previous_month["High"].max())
+
+    current_month_positions = [
+        i for i, date in enumerate(dates)
+        if date >= month_start and date.date() < now.date()
+    ]
+    if len(current_month_positions) < 2:
+        return None
+
+    # Find only the first green breakout candle of the current calendar month.
+    breakout_i = None
+    for i in current_month_positions:
+        if i == 0:
             continue
-        greens = [i]
-        j = i + 1
-        while j < len(values) and len(greens) < green_limit:
-            next_c = values.iloc[j]
-            if float(next_c["Close"]) > float(next_c["Open"]):
-                greens.append(j)
-                j += 1
-            else:
+        candle = data.iloc[i]
+        previous = data.iloc[i - 1]
+        if (
+            float(candle["Close"]) > float(candle["Open"])
+            and float(candle["Close"]) > previous_month_high
+            and float(previous["Close"]) <= previous_month_high
+        ):
+            breakout_i = i
+            break
+
+    if breakout_i is None:
+        return None
+
+    breakout = data.iloc[breakout_i]
+    breakout_high = float(breakout["High"])
+    last_green_high = breakout_high
+
+    # Valid patterns:
+    # breakout green -> 1 green -> red
+    # breakout green -> 2 greens -> red
+    # breakout green -> 3 greens -> red
+    # Red candle must immediately follow the 1st, 2nd, or 3rd green candle.
+    green_count = 0
+    red_i = None
+    red = None
+
+    for j in range(breakout_i + 1, len(data)):
+        if dates[j].date() >= now.date():
+            break
+        candle = data.iloc[j]
+        open_price = float(candle["Open"])
+        close_price = float(candle["Close"])
+        high_price = float(candle["High"])
+
+        if close_price > open_price:
+            green_count += 1
+            last_green_high = high_price
+            if green_count > 3:
                 break
-        if j >= len(values):
-            found = {
-                "symbol": symbol, "range_from": str(start_date), "range_to": str(end_date),
-                "range_high": range_high, "range_high_time": range_high_time,
-                "breakout_time": str(values.index[i]), "green_count": len(greens),
-                "red_time": "", "red_high": None, "status": "Waiting for red candle",
-                "entry_price": None, "entry_time": "", "current_price": float(values["Close"].iloc[-1])
-            }
             continue
-        red = values.iloc[j]
-        if float(red["Close"]) >= float(red["Open"]):
-            continue
-        if float(red["High"]) >= float(values.iloc[greens[-1]]["High"]):
-            continue
-        next_i = j + 1
-        if next_i >= len(values):
-            found = {
-                "symbol": symbol, "range_from": str(start_date), "range_to": str(end_date),
-                "range_high": range_high, "range_high_time": range_high_time,
-                "breakout_time": str(values.index[i]), "green_count": len(greens),
-                "red_time": str(values.index[j]), "red_high": float(red["High"]),
-                "status": "Waiting for next candle to break red High",
-                "entry_price": None, "entry_time": "", "current_price": float(values["Close"].iloc[-1])
-            }
-            continue
-        next_candle = values.iloc[next_i]
-        if float(next_candle["High"]) >= float(red["High"]):
-            found = {
-                "symbol": symbol, "range_from": str(start_date), "range_to": str(end_date),
-                "range_high": range_high, "range_high_time": range_high_time,
-                "breakout_time": str(values.index[i]), "green_count": len(greens),
-                "red_time": str(values.index[j]), "red_high": float(red["High"]),
-                "status": "Entry triggered", "entry_price": float(red["High"]),
-                "entry_time": str(values.index[next_i]), "current_price": float(values["Close"].iloc[-1])
-            }
+
+        if close_price < open_price:
+            if 1 <= green_count <= 3 and high_price < last_green_high:
+                red_i = j
+                red = candle
+            break
+
+        # A doji interrupts the pattern.
+        break
+
+    if red is None:
+        return None
+
+    # 52-week low proximity and a simple rising-trend score for result ranking.
+    one_year_low = float(data["Low"].tail(252).min())
+    percent_above_52w_low = ((latest_price / one_year_low) - 1.0) * 100.0 if one_year_low > 0 else float("nan")
+    close_series = data["Close"].astype(float)
+    ma5 = float(close_series.tail(5).mean()) if len(close_series) >= 5 else float("nan")
+    ma20 = float(close_series.tail(20).mean()) if len(close_series) >= 20 else float("nan")
+    rising_trend = bool(latest_price > ma20 and ma5 > ma20) if pd.notna(ma20) and pd.notna(ma5) else False
+
+    return {
+        "Symbol": symbol,
+        "Rising Trend": "Yes" if rising_trend else "No",
+        "52-Week Low (INR)": round(one_year_low, 2),
+        "% Above 52-Week Low": round(percent_above_52w_low, 2),
+        "Previous Month High (INR)": round(previous_month_high, 2),
+        "Breakout Date": str(dates[breakout_i].date()),
+        "Breakout Candle High (INR)": round(breakout_high, 2),
+        "Red Confirmation Date": str(dates[red_i].date()),
+        "Red Candle High (INR)": round(float(red["High"]), 2),
+    }
+
+
+with st.sidebar:
+    st.header("Scan Settings")
+    min_price = st.number_input("Minimum Price (INR)", min_value=0.0, value=100.0, step=10.0)
+    max_price = st.number_input("Maximum Price (INR)", min_value=1.0, value=5000.0, step=100.0)
+    scan_size = st.selectbox(
+        "Stocks to Scan",
+        [
+            "All eligible cash stocks",
+            "First 100 (test)",
+            "First 250",
+        ],
+    )
+    st.caption("Full scan may take several minutes. Market data may be delayed or incomplete.")
+
+if min_price > max_price:
+    st.error("Minimum price must not exceed maximum price.")
+    st.stop()
+
+metric1, metric2, metric3 = st.columns(3)
+metric1.metric("Timeframe", "Daily")
+metric2.metric("Price Range", f"INR {min_price:g} - {max_price:g}")
+metric3.metric("Market", "NSE Cash (F&O excluded)")
+
+if st.button("Scan Stocks Now", type="primary", use_container_width=True):
+    try:
+        with st.spinner("Loading NSE symbol lists..."):
+            symbols = get_symbols()
+
+        if scan_size.startswith("First 100"):
+            symbols = symbols[:100]
+        elif scan_size.startswith("First 250"):
+            symbols = symbols[:250]
+
+        st.write(f"**Stocks to scan:** {len(symbols)}")
+        results = []
+        failures = 0
+        progress = st.progress(0)
+        status = st.empty()
+
+        for number, symbol in enumerate(symbols, start=1):
+            status.write(f"Checking **{symbol}** ({number}/{len(symbols)})")
+            try:
+                match = scan_symbol(symbol, min_price, max_price)
+                if match:
+                    results.append(match)
+            except Exception:
+                failures += 1
+            progress.progress(number / max(1, len(symbols)))
+
+        status.empty()
+        progress.empty()
+        result_df = pd.DataFrame(results)
+
+        if not result_df.empty:
+            # Prioritize stocks showing a rising trend, then those still closest
+            # to their 52-week low, then the most recent confirmation.
+            result_df["Rising Trend Sort"] = result_df["Rising Trend"].eq("Yes").astype(int)
+            result_df = result_df.sort_values(
+                ["Rising Trend Sort", "% Above 52-Week Low", "Red Confirmation Date", "Symbol"],
+                ascending=[False, True, False, True],
+            ).drop(columns=["Rising Trend Sort"]).reset_index(drop=True)
+            st.success(f"Scan complete: {len(result_df)} matching stock(s).")
+
+            # Separate today's confirmed signals from all current-month signals.
+            # Today's unfinished candle is excluded by the scanner, so this tab
+            # only contains signals whose completed red confirmation is dated today.
+            today_text = datetime.now(IST).date().isoformat()
+            today_df = result_df[result_df["Red Confirmation Date"] == today_text].copy()
+            month_start_text = datetime.now(IST).date().replace(day=1).isoformat()
+            month_df = result_df[result_df["Red Confirmation Date"] >= month_start_text].copy()
+
+            today_tab, month_tab = st.tabs(["Today's Shares", "This Month's Shares"])
+            with today_tab:
+                st.caption(f"Confirmed red-candle signals dated {today_text}.")
+                if today_df.empty:
+                    st.info("No confirmed signals dated today. Today's incomplete candle is ignored.")
+                else:
+                    st.dataframe(today_df, use_container_width=True, hide_index=True)
+                    st.download_button(
+                        "Download Today's CSV",
+                        data=today_df.to_csv(index=False).encode("utf-8-sig"),
+                        file_name="nse_breakout_todays_shares.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key="download_today_csv",
+                    )
+            with month_tab:
+                st.caption(f"All matching signals this month, from {month_start_text} onward.")
+                st.dataframe(month_df, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "Download This Month's CSV",
+                    data=month_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="nse_breakout_this_month_shares.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="download_month_csv",
+                )
+                excel_buffer = io.BytesIO()
+                with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+                    today_df.to_excel(writer, index=False, sheet_name="Today's Shares")
+                    month_df.to_excel(writer, index=False, sheet_name="This Month")
+                st.download_button(
+                    "Download Excel (Both Lists)",
+                    data=excel_buffer.getvalue(),
+                    file_name="nse_breakout_daily_and_monthly_shares.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key="download_both_excel",
+                )
         else:
-            found = {
-                "symbol": symbol, "range_from": str(start_date), "range_to": str(end_date),
-                "range_high": range_high, "range_high_time": range_high_time,
-                "breakout_time": str(values.index[i]), "green_count": len(greens),
-                "red_time": str(values.index[j]), "red_high": float(red["High"]),
-                "status": "Next candle did not break red High", "entry_price": None,
-                "entry_time": "", "current_price": float(values["Close"].iloc[-1])
-            }
-    return found, None
-
-signal_cols = ["symbol","range_from","range_to","range_high","range_high_time","breakout_time","green_count","red_time","red_high","status","entry_price","entry_time","current_price"]
-trade_cols = ["symbol","entry_time","entry_price","quantity","current_price","pnl_rupees","pnl_percent","status"]
-
-def read_csv(path, cols):
-    """Load existing CSV while tolerating older schemas from previous app versions."""
-    if path.exists():
-        try:
-            df = pd.read_csv(path)
-            # Older CSVs may not have columns introduced by a newer app version.
-            for col in cols:
-                if col not in df.columns:
-                    df[col] = pd.NA
-            # Keep expected columns first; preserve extra historical columns afterward.
-            return df[cols + [c for c in df.columns if c not in cols]]
-        except Exception:
-            pass
-    return pd.DataFrame(columns=cols)
-
-if st.button("🔄 Scan Nifty 100", type="primary"):
-    symbols, source = get_nifty100_symbols()
-    progress = st.progress(0, text="Scanning stocks…")
-    results = []
-    for n, symbol in enumerate(symbols):
-        result, err = analyze_symbol(symbol, start_date, end_date, green_limit)
-        if result:
-            results.append(result)
-        progress.progress((n + 1) / len(symbols), text=f"{symbol} ({n+1}/{len(symbols)})")
-    progress.empty()
-    signals = pd.DataFrame(results, columns=signal_cols)
-    signals.to_csv(SIGNALS_PATH, index=False)
-    trades = read_csv(TRADES_PATH, trade_cols)
-    existing = set()
-    if not trades.empty:
-        existing = set(trades["symbol"].astype(str) + "|" + trades["entry_time"].astype(str))
-    for row in results:
-        if row["status"] == "Entry triggered" and pd.notna(row["entry_price"]):
-            key = str(row["symbol"]) + "|" + str(row["entry_time"])
-            if key not in existing:
-                entry = float(row["entry_price"])
-                qty = int(capital // entry) if entry > 0 else 0
-                trades = pd.concat([trades, pd.DataFrame([{
-                    "symbol": row["symbol"], "entry_time": row["entry_time"],
-                    "entry_price": entry, "quantity": qty, "current_price": float(row["current_price"]),
-                    "pnl_rupees": (float(row["current_price"]) - entry) * qty,
-                    "pnl_percent": ((float(row["current_price"]) - entry) / entry) * 100,
-                    "status": "OPEN"
-                }])], ignore_index=True)
-                existing.add(key)
-    trades.to_csv(TRADES_PATH, index=False)
-    st.success(f"Scan complete: {len(symbols)} symbols checked. Source: {source}")
-    if len(symbols) < 100:
-        st.warning("Full Nifty 100 list load nahi hui; fallback partial list use hui.")
-
-signals = read_csv(SIGNALS_PATH, signal_cols)
-trades = read_csv(TRADES_PATH, trade_cols)
-st.subheader("🔔 Breakout / Red Candle Signals")
-if signals.empty:
-    st.info("Date range choose karke Scan dabayein.")
+            st.warning(
+                "No stocks matched the rules in this scan."
+            )
+        if failures:
+            st.caption(
+                f"{failures} symbol(s) could not be checked due to data/network errors."
+            )
+    except Exception as error:
+        st.error(f"Scan failed: {error}")
 else:
-    # Defensive schema repair: supports signals.csv saved by older app versions.
-    for c in signal_cols:
-        if c not in signals.columns:
-            signals[c] = pd.NA
-    for c in ["range_high","red_high","entry_price","current_price"]:
-        signals[c] = pd.to_numeric(signals[c], errors="coerce").round(2)
-    st.dataframe(signals, use_container_width=True, hide_index=True)
+    st.write(
+        "Set the price range in the sidebar and press Scan Stocks Now."
+    )
+    st.caption(
+        "Results will appear here. CSV and Excel download buttons appear after the scan."
+    )
 
-st.subheader("📒 Paper Trading — Trade Sheet")
-if trades.empty:
-    st.info("Abhi koi paper entry trigger nahi hui.")
-else:
-    for c in trade_cols:
-        if c not in trades.columns:
-            trades[c] = pd.NA
-    for c in ["entry_price","current_price","quantity"]:
-        trades[c] = pd.to_numeric(trades[c], errors="coerce")
-    trades["pnl_rupees"] = ((trades["current_price"] - trades["entry_price"]) * trades["quantity"]).round(2)
-    trades["pnl_percent"] = (((trades["current_price"] - trades["entry_price"]) / trades["entry_price"]) * 100).round(2)
-    st.dataframe(trades, use_container_width=True, hide_index=True)
-    c1, c2 = st.columns(2)
-    c1.metric("Open paper trades", int((trades["status"] == "OPEN").sum()))
-    c2.metric("Unrealized P&L (₹)", f"₹{trades['pnl_rupees'].sum():,.2f}")
-    st.download_button("⬇️ Download Excel-compatible CSV", trades.to_csv(index=False).encode("utf-8-sig"), "paper_trades.csv", "text/csv")
+with st.expander("Scanner Rules"):
+    st.markdown(
+        """
+        1. Scan NSE EQ cash-market symbols and exclude symbols in the NSE F&O list.
+        2. Latest completed daily close must be within the selected price range.
+        3. The breakout candle is the first green daily candle in the current month that closes above the previous completed calendar month's High from below.
+        4. After the breakout candle, the valid sequence is exactly 1, 2, or 3 additional green daily candles followed immediately by a red candle.
+        5. The red candle's High must be lower than the immediately preceding green candle's High.
+        6. Results prioritize a rising trend (latest close above the 20-day average and 5-day average above the 20-day average), then stocks closest to their 52-week Low. The results are split into Today's Shares and This Month's Shares tabs.
+        7. Only one signal per symbol per month; the setup resets when a new month starts.
+        8. Today's incomplete candle is ignored.
+        """
+    )
 
-st.caption("The selected date range is used only to calculate the reference High. Breakout scanning starts strictly after the ending date using completed hourly candles. Yahoo Finance may be delayed/incomplete. No real orders are placed.")
+st.caption("Educational screening tool only â€” not a buy/sell recommendation.")
