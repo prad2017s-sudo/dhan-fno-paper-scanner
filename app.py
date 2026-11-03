@@ -1,4 +1,7 @@
-
+import streamlit as st
+import pandas as pd
+import yfinance as yf
+from concurrent.futures import ThreadPoolExecutor, as_completed
 @st.cache_data(ttl=3600)
 def get_symbols():
     try:
