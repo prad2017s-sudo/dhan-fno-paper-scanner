@@ -2,7 +2,6 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
-import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # =========================
@@ -22,9 +21,8 @@ st.set_page_config(
 st.title("Nifty 500 Daily CCI Scanner")
 
 st.write("""
-**स्कैनिंग नियम**
-- केवल Nifty 500
-- F&O शेयर हटाएँ
+- Nifty 500 के सभी शेयर
+- F&O शेयर भी शामिल
 - शेयर भाव ₹100 से ₹5000
 - Daily CCI Turbo Length 6
 - Daily CCI की बंद कैंडल 0 के ऊपर
@@ -37,85 +35,37 @@ st.write("""
 @st.cache_data(ttl=3600)
 def get_nifty500_symbols():
 
-    url = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20500"
-
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
-        "Referer": "https://www.nseindia.com/"
-    }
+    url = (
+        "https://www.niftyindices.com/"
+        "IndexConstituent/ind_nifty500list.csv"
+    )
 
     try:
-        session = requests.Session()
-        session.headers.update(headers)
+        df = pd.read_csv(url)
 
-        session.get(
-            "https://www.nseindia.com",
-            timeout=20
-        )
-
-        response = session.get(
-            url,
-            timeout=30
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        symbols = [
-            item["symbol"]
-            for item in data.get("data", [])
-            if "symbol" in item
-            and item["symbol"] != "NIFTY 500"
+        df.columns = [
+            str(c).strip().upper()
+            for c in df.columns
         ]
 
-        return sorted(set(symbols))
+        if "SYMBOL" not in df.columns:
+            st.error("Nifty 500 Symbol column नहीं मिली")
+            return []
+
+        symbols = (
+            df["SYMBOL"]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .unique()
+            .tolist()
+        )
+
+        return sorted(symbols)
 
     except Exception as e:
-        st.error(f"Nifty 500 सूची नहीं मिली: {e}")
+        st.error(f"Nifty 500 सूची Error: {e}")
         return []
-
-
-# =========================
-# F&O LIST
-# =========================
-
-@st.cache_data(ttl=3600)
-def get_fo_symbols():
-
-    urls = [
-        "https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv",
-        "https://archives.nseindia.com/content/fo/fo_mktlots.csv"
-    ]
-
-    for url in urls:
-        try:
-            df = pd.read_csv(url)
-
-            df.columns = [
-                str(c).strip().upper()
-                for c in df.columns
-            ]
-
-            symbol_col = next(
-                (c for c in df.columns if "SYMBOL" in c),
-                None
-            )
-
-            if symbol_col:
-                return set(
-                    df[symbol_col]
-                    .dropna()
-                    .astype(str)
-                    .str.strip()
-                )
-
-        except Exception:
-            continue
-
-    st.warning("F&O सूची डाउनलोड नहीं हुई।")
-    return None
 
 
 # =========================
@@ -125,7 +75,9 @@ def get_fo_symbols():
 def calculate_cci(df, length=6):
 
     typical_price = (
-        df["High"] + df["Low"] + df["Close"]
+        df["High"] +
+        df["Low"] +
+        df["Close"]
     ) / 3
 
     sma = typical_price.rolling(length).mean()
@@ -152,6 +104,7 @@ def calculate_cci(df, length=6):
 def scan_stock(symbol):
 
     try:
+
         df = yf.download(
             symbol + ".NS",
             period="60d",
@@ -167,9 +120,11 @@ def scan_stock(symbol):
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        required = ["Open", "High", "Low", "Close", "Volume"]
+        required = [
+            "Open", "High", "Low", "Close", "Volume"
+        ]
 
-        if not all(col in df.columns for col in required):
+        if not all(c in df.columns for c in required):
             return None
 
         df = df[required].dropna()
@@ -188,12 +143,12 @@ def scan_stock(symbol):
         close_price = float(latest["Close"])
         fast_cci = float(latest["CCI_FAST"])
 
-        # Price ₹100 to ₹5000
+        # Price filter
         price_condition = (
             MIN_PRICE <= close_price <= MAX_PRICE
         )
 
-        # Daily CCI above Zero Line
+        # CCI above Zero Line
         cci_condition = fast_cci > 0
 
         if price_condition and cci_condition:
@@ -225,28 +180,16 @@ workers = st.slider(
 
 if st.button("SCAN START", type="primary"):
 
-    with st.spinner("Nifty 500 शेयर सूची डाउनलोड हो रही है..."):
+    symbols = get_nifty500_symbols()
 
-        nifty_symbols = get_nifty500_symbols()
-        fo_symbols = get_fo_symbols()
+    if not symbols:
 
-    if not nifty_symbols:
-        st.error("Nifty 500 शेयर सूची नहीं मिली।")
-
-    elif fo_symbols is None:
-        st.error("F&O सूची नहीं मिली। F&O हटाए बिना स्कैन नहीं किया गया।")
+        st.error("Nifty 500 शेयर सूची डाउनलोड नहीं हुई।")
 
     else:
 
-        # Remove F&O shares
-        cash_symbols = [
-            symbol for symbol in nifty_symbols
-            if symbol not in fo_symbols
-        ]
-
         st.info(
-            f"Nifty 500: {len(nifty_symbols)} | "
-            f"F&O हटाने के बाद: {len(cash_symbols)}"
+            f"Nifty 500 में कुल शेयर: {len(symbols)}"
         )
 
         results = []
@@ -260,7 +203,7 @@ if st.button("SCAN START", type="primary"):
 
             futures = {
                 executor.submit(scan_stock, symbol): symbol
-                for symbol in cash_symbols
+                for symbol in symbols
             }
 
             total = len(futures)
@@ -321,5 +264,5 @@ if st.button("SCAN START", type="primary"):
             )
 
 st.caption(
-    "Daily CCI 6 > 0 | Price ₹100–₹5000 | Nifty 500 | F&O Excluded"
+    "Nifty 500 | F&O Included | CCI 6 > 0 | Price ₹100–₹5000"
 )
