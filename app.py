@@ -2,16 +2,13 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# =========================
-# SETTINGS
-# =========================
+import requests
+from io import BytesIO
 
 CCI_LENGTH = 6
 MIN_PRICE = 100
 MAX_PRICE = 5000
-MAX_WORKERS = 5
+BATCH_SIZE = 50
 
 st.set_page_config(
     page_title="Nifty 500 Daily CCI Scanner",
@@ -21,38 +18,47 @@ st.set_page_config(
 st.title("Nifty 500 Daily CCI Scanner")
 
 st.write("""
-- Nifty 500 के सभी शेयर
-- F&O शेयर भी शामिल
-- शेयर भाव ₹100 से ₹5000
-- Daily CCI Turbo Length 6
-- Daily CCI की बंद कैंडल 0 के ऊपर
+Nifty 500 | F&O Included
+Daily CCI Turbo 6 > 0
+Share Price ₹100–₹5000
 """)
+
 
 # =========================
 # NIFTY 500 LIST
 # =========================
 
 @st.cache_data(ttl=3600)
-def get_nifty500_symbols():
+def get_symbols():
 
     url = (
         "https://www.niftyindices.com/"
         "IndexConstituent/ind_nifty500list.csv"
     )
 
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
     try:
-        df = pd.read_csv(url)
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=30
+        )
+
+        response.raise_for_status()
+
+        df = pd.read_csv(
+            BytesIO(response.content)
+        )
 
         df.columns = [
             str(c).strip().upper()
             for c in df.columns
         ]
 
-        if "SYMBOL" not in df.columns:
-            st.error("Nifty 500 Symbol column नहीं मिली")
-            return []
-
-        symbols = (
+        return sorted(
             df["SYMBOL"]
             .dropna()
             .astype(str)
@@ -61,10 +67,8 @@ def get_nifty500_symbols():
             .tolist()
         )
 
-        return sorted(symbols)
-
     except Exception as e:
-        st.error(f"Nifty 500 सूची Error: {e}")
+        st.error(f"Nifty 500 Error: {e}")
         return []
 
 
@@ -74,160 +78,166 @@ def get_nifty500_symbols():
 
 def calculate_cci(df, length=6):
 
-    typical_price = (
+    tp = (
         df["High"] +
         df["Low"] +
         df["Close"]
     ) / 3
 
-    sma = typical_price.rolling(length).mean()
+    sma = tp.rolling(length).mean()
 
-    mean_deviation = typical_price.rolling(
-        length
-    ).apply(
+    mean_dev = tp.rolling(length).apply(
         lambda x: abs(x - x.mean()).mean(),
         raw=True
     )
 
-    cci = (
-        (typical_price - sma)
-        / (0.015 * mean_deviation)
-    )
+    cci = (tp - sma) / (0.015 * mean_dev)
 
     return cci
 
 
 # =========================
-# SCAN STOCK
+# BATCH SCANNER
 # =========================
 
-def scan_stock(symbol):
+def scan_batch(symbols):
+
+    tickers = [
+        symbol + ".NS"
+        for symbol in symbols
+    ]
 
     try:
 
-        df = yf.download(
-            symbol + ".NS",
+        data = yf.download(
+            tickers=tickers,
             period="60d",
             interval="1d",
+            group_by="ticker",
             auto_adjust=False,
+            threads=True,
             progress=False,
-            threads=False
+            timeout=30
         )
 
-        if df.empty:
-            return None
+        if data.empty:
+            return []
 
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        results = []
 
-        required = [
-            "Open", "High", "Low", "Close", "Volume"
-        ]
+        for symbol in symbols:
 
-        if not all(c in df.columns for c in required):
-            return None
+            ticker = symbol + ".NS"
 
-        df = df[required].dropna()
+            try:
 
-        if len(df) < CCI_LENGTH + 2:
-            return None
+                if isinstance(data.columns, pd.MultiIndex):
 
-        # Daily CCI Turbo 6
-        df["CCI_FAST"] = calculate_cci(
-            df,
-            CCI_LENGTH
-        )
+                    if ticker not in data.columns.get_level_values(0):
+                        continue
 
-        latest = df.iloc[-1]
+                    df = data[ticker].copy()
 
-        close_price = float(latest["Close"])
-        fast_cci = float(latest["CCI_FAST"])
+                else:
 
-        # Price filter
-        price_condition = (
-            MIN_PRICE <= close_price <= MAX_PRICE
-        )
+                    if len(symbols) != 1:
+                        continue
 
-        # CCI above Zero Line
-        cci_condition = fast_cci > 0
+                    df = data.copy()
 
-        if price_condition and cci_condition:
+                required = [
+                    "Open", "High", "Low", "Close"
+                ]
 
-            return {
-                "Symbol": symbol,
-                "Date": df.index[-1].strftime("%Y-%m-%d"),
-                "Close Price": round(close_price, 2),
-                "Daily CCI Turbo 6": round(fast_cci, 2),
-                "Signal": "CCI ABOVE ZERO"
-            }
+                if not all(
+                    c in df.columns
+                    for c in required
+                ):
+                    continue
 
-    except Exception:
-        return None
+                df = df[required].dropna()
 
-    return None
+                if len(df) < 10:
+                    continue
+
+                df["CCI"] = calculate_cci(
+                    df,
+                    CCI_LENGTH
+                )
+
+                latest = df.iloc[-1]
+
+                price = float(latest["Close"])
+                cci = float(latest["CCI"])
+
+                if (
+                    MIN_PRICE <= price <= MAX_PRICE
+                    and cci > 0
+                ):
+
+                    results.append({
+                        "Symbol": symbol,
+                        "Date": df.index[-1].strftime("%Y-%m-%d"),
+                        "Price": round(price, 2),
+                        "Daily CCI 6": round(cci, 2),
+                        "Signal": "CCI ABOVE ZERO"
+                    })
+
+            except Exception:
+                continue
+
+        return results
+
+    except Exception as e:
+
+        st.warning(f"Batch download error: {e}")
+
+        return []
 
 
 # =========================
-# STREAMLIT SCANNER
+# STREAMLIT SCAN
 # =========================
-
-workers = st.slider(
-    "एक साथ कितने शेयर स्कैन करें?",
-    min_value=2,
-    max_value=10,
-    value=5
-)
 
 if st.button("SCAN START", type="primary"):
 
-    symbols = get_nifty500_symbols()
+    symbols = get_symbols()
 
     if not symbols:
 
-        st.error("Nifty 500 शेयर सूची डाउनलोड नहीं हुई।")
+        st.error("Nifty 500 सूची नहीं मिली।")
 
     else:
 
         st.info(
-            f"Nifty 500 में कुल शेयर: {len(symbols)}"
+            f"कुल Nifty 500 शेयर: {len(symbols)}"
         )
+
+        batches = [
+            symbols[i:i + BATCH_SIZE]
+            for i in range(0, len(symbols), BATCH_SIZE)
+        ]
 
         results = []
 
         progress = st.progress(0)
         status = st.empty()
 
-        with ThreadPoolExecutor(
-            max_workers=workers
-        ) as executor:
+        for i, batch in enumerate(batches):
 
-            futures = {
-                executor.submit(scan_stock, symbol): symbol
-                for symbol in symbols
-            }
+            status.text(
+                f"Batch {i+1}/{len(batches)} "
+                f"| शेयर {len(batch)} "
+                f"| Found {len(results)}"
+            )
 
-            total = len(futures)
-            completed = 0
+            batch_results = scan_batch(batch)
 
-            for future in as_completed(futures):
+            results.extend(batch_results)
 
-                completed += 1
-
-                try:
-                    result = future.result()
-
-                    if result:
-                        results.append(result)
-
-                except Exception:
-                    pass
-
-                progress.progress(completed / total)
-
-                status.text(
-                    f"Scanned {completed}/{total} | "
-                    f"Found {len(results)}"
-                )
+            progress.progress(
+                (i + 1) / len(batches)
+            )
 
         progress.empty()
         status.empty()
@@ -236,7 +246,9 @@ if st.button("SCAN START", type="primary"):
 
             result_df = pd.DataFrame(results)
 
-            result_df = result_df.sort_values("Symbol")
+            result_df = result_df.sort_values(
+                "Symbol"
+            )
 
             st.success(
                 f"कुल शेयर मिले: {len(result_df)}"
@@ -262,7 +274,3 @@ if st.button("SCAN START", type="primary"):
             st.warning(
                 "CCI नियम के अनुसार कोई शेयर नहीं मिला।"
             )
-
-st.caption(
-    "Nifty 500 | F&O Included | CCI 6 > 0 | Price ₹100–₹5000"
-)
