@@ -66,6 +66,12 @@ def load_saved_watchlist() -> str:
     return DEFAULT_112_WATCHLIST
 
 
+def reset_watchlist_callback():
+    st.session_state.watchlist_input = DEFAULT_112_WATCHLIST
+    if WATCHLIST_FILE.exists():
+        WATCHLIST_FILE.unlink()
+
+
 # Session State
 if "weekly_df" not in st.session_state:
     st.session_state.weekly_df = None
@@ -107,7 +113,7 @@ def get_nse_symbols(category: str):
         return []
 
 
-# --- 2. Woodies Pivot & CCI (14) कैलकुलेशन (Weekly और Daily दोनों के लिए) ---
+# --- 2. Woodies Pivot & CCI (14) कैलकुलेशन (सिर्फ़ 1st Bar Breakout के साथ) ---
 def analyze_woodies_cci(
     ticker: str,
     df: pd.DataFrame,
@@ -144,7 +150,7 @@ def analyze_woodies_cci(
         r1 = (2 * pp) - low
         s1 = (2 * pp) - high
 
-        # Woodies CCI (14)
+        # Woodies CCI (14) - HLC3 (TradingView / Dhan Standard)
         tp = (sub_df["High"] + sub_df["Low"] + sub_df["Close"]) / 3
         sma_tp = tp.rolling(window=14).mean()
         mean_dev = tp.rolling(window=14).apply(
@@ -161,13 +167,22 @@ def analyze_woodies_cci(
         curr_cci = float(curr_cci)
         prev_cci = float(prev_cci)
 
-        fresh_cross = prev_cci <= 0 and curr_cci > 0
+        # गिनें कि 0-लाइन के ऊपर लगातार कितने बार (bars) बने हैं
+        bars_above_zero = 0
+        for val in reversed(cci.dropna().tolist()):
+            if val > 0:
+                bars_above_zero += 1
+            else:
+                break
+
+        # सिर्फ़ 1st बार पर सिग्नल (पिछला बार <= 0 और वर्तमान बार > 0)
+        first_bar_cross = (bars_above_zero == 1) and (prev_cci <= 0)
         above_zero = curr_cci > 0
 
-        if fresh_cross:
-            status = "🔥 Fresh 0-Line Breakout"
+        if first_bar_cross:
+            status = "🔥 1st Bar Breakout (0-Line Cross)"
         elif above_zero:
-            status = "📈 Above 0-Line (Bullish)"
+            status = f"📈 Bar #{bars_above_zero} Above 0-Line"
         else:
             status = "🔻 Below 0-Line (Bearish)"
 
@@ -180,12 +195,13 @@ def analyze_woodies_cci(
             "Symbol": clean_name,
             "Close (₹)": round(close, 2),
             "Status": status,
+            "Bars Above 0": bars_above_zero,
             curr_col: round(curr_cci, 2),
             prev_col: round(prev_cci, 2),
             f"{prefix} Pivot (PP)": round(pp, 2),
             f"{prefix} R1": round(r1, 2),
             f"{prefix} S1": round(s1, 2),
-            "Fresh_Cross": fresh_cross,
+            "Fresh_Cross": first_bar_cross,
             "Above_Zero": above_zero,
         }
     except Exception:
@@ -222,7 +238,7 @@ st.sidebar.info(f"स्कैन होने वाले कुल शेय�
 weekly_scan_type = st.sidebar.radio(
     "कंडीशन चुनें (Weekly Candle):",
     [
-        "🔥 इस हफ्ते 0-Line क्रॉस करने वाले (Weekly Fresh Breakout)",
+        "🔥 इस हफ्ते 1st Bar 0-Line क्रॉस करने वाले (Weekly Fresh Breakout)",
         "📈 वर्तमान में Weekly 0-Line के ऊपर (Weekly Bullish)",
     ],
 )
@@ -255,7 +271,7 @@ if start_weekly_scan:
                     period="1y",
                     interval="1wk",
                     group_by="ticker",
-                    auto_adjust=True,
+                    auto_adjust=False,
                     progress=False,
                     threads=True,
                 )
@@ -330,7 +346,7 @@ with wl_col2:
     daily_filter = st.radio(
         "1-Day फ़िल्टर चुनें:",
         [
-            "🔥 सिर्फ आज 0-Line क्रॉस करने वाले (Fresh Breakout)",
+            "🔥 सिर्फ आज 1st Bar Breakout (0-Line Cross)",
             "📈 आज 0-Line के ऊपर चल रहे (Bullish)",
             "📊 सभी वॉचलिस्ट शेयर्स का स्टेटस दिखाएं (All)",
         ],
@@ -344,17 +360,14 @@ with wl_col2:
 btn_c1, btn_c2, btn_c3 = st.columns([2, 1, 1])
 run_watchlist_btn = btn_c1.button("🔎 1-Day Candle पर वॉचलिस्ट रन करें", type="primary")
 save_wl_btn = btn_c2.button("💾 वॉचलिस्ट सेव करें")
-reset_wl_btn = btn_c3.button("🔄 112 डिफ़ॉल्ट रीलोड करें")
+reset_wl_btn = btn_c3.button(
+    "🔄 112 डिफ़ॉल्ट रीलोड करें",
+    on_click=reset_watchlist_callback,
+)
 
 if save_wl_btn:
     WATCHLIST_FILE.write_text(watchlist_text.strip(), encoding="utf-8")
     st.success("✅ आपकी वॉचलिस्ट `my_watchlist.txt` में सेव हो गई!")
-
-if reset_wl_btn:
-    st.session_state.watchlist_input = DEFAULT_112_WATCHLIST
-    if WATCHLIST_FILE.exists():
-        WATCHLIST_FILE.unlink()
-    st.rerun()
 
 if run_watchlist_btn:
     raw_tokens = re.split(r"[,\s\n;]+", watchlist_text.strip())
@@ -364,79 +377,4 @@ if run_watchlist_btn:
         if not t:
             continue
         if not (t.endswith(".NS") or t.endswith(".BO")):
-            t = f"{t}.NS"
-        clean_symbols.append(t)
-
-    clean_symbols = list(dict.fromkeys(clean_symbols))
-
-    if not clean_symbols:
-        st.warning("⚠️ कृपया बॉक्स में कम से कम 1 शेयर का नाम डालें।")
-    else:
-        with st.spinner(f"{len(clean_symbols)} शेयर्स का 1-Day डेटा स्कैन हो रहा है..."):
-            wl_results = []
-            wl_failed = []
-            batch_size = 50
-
-            for i in range(0, len(clean_symbols), batch_size):
-                batch = clean_symbols[i : i + batch_size]
-                try:
-                    wl_data = yf.download(
-                        batch,
-                        period="2mo",
-                        interval="1d",
-                        group_by="ticker",
-                        auto_adjust=True,
-                        progress=False,
-                        threads=True,
-                    )
-
-                    for sym in batch:
-                        res = analyze_woodies_cci(
-                            sym,
-                            wl_data,
-                            timeframe_label="Daily",
-                            min_p=min_price if apply_price_on_wl else None,
-                            max_p=max_price if apply_price_on_wl else None,
-                        )
-                        if res is None:
-                            wl_failed.append(re.sub(r"\.(NS|BO)$", "", sym))
-                        else:
-                            if "सिर्फ आज 0-Line क्रॉस" in daily_filter and not res["Fresh_Cross"]:
-                                continue
-                            if "आज 0-Line के ऊपर" in daily_filter and not res["Above_Zero"]:
-                                continue
-                            wl_results.append(res)
-                except Exception:
-                    wl_failed.extend([re.sub(r"\.(NS|BO)$", "", s) for s in batch])
-
-            st.session_state.watchlist_failed = wl_failed
-            if wl_results:
-                st.session_state.watchlist_df = (
-                    pd.DataFrame(wl_results)
-                    .drop(columns=["Fresh_Cross", "Above_Zero"])
-                    .sort_values(by="Today CCI", ascending=False)
-                    .reset_index(drop=True)
-                )
-            else:
-                st.session_state.watchlist_df = pd.DataFrame()
-
-if st.session_state.watchlist_df is not None:
-    if not st.session_state.watchlist_df.empty:
-        df_d = st.session_state.watchlist_df
-        st.success(f"✅ 1-Day वॉचलिस्ट स्कैन पूरा! कुल **{len(df_d)}** शेयर फ़िल्टर हुए।")
-        st.dataframe(df_d, width="stretch")
-
-        csv_d = df_d.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "📥 वॉचलिस्ट 1-Day रिजल्ट डाउनलोड करें (CSV)",
-            csv_d,
-            "my_112_watchlist_1day_cci.csv",
-            "text/csv",
-        )
-    else:
-        st.warning("तय 1-Day कंडीशन में आपकी वॉचलिस्ट से आज कोई शेयर नहीं मिला। (आप '📊 सभी वॉचलिस्ट शेयर्स दिखाएं' चुनकर सबका CCI देख सकते हैं।)")
-
-    if st.session_state.watchlist_failed and not apply_price_on_wl:
-        st.caption(
-            f"⚠️ कम कैंडल (<16 दिन, जैसे नए IPO) या डेटा न मिलने वाले सिंबल: {', '.join(st.session_state.watchlist_failed)}"
-        )
+            t = f"{t}.
